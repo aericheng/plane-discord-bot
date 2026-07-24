@@ -1,0 +1,14 @@
+{
+  "name": "plane-discord-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Discord bot: create Plane issues (calendar events) via conversation",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
