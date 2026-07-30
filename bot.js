@@ -15,6 +15,7 @@ const {
   ButtonBuilder,
   ButtonStyle,
 } = require('discord.js');
+const { runAiParse, killActiveClaudeChildren, taipeiTodayInfo } = require('./ai-intake');
 
 // ===== Plane 設定 =====
 const PLANE = {
@@ -44,15 +45,20 @@ const LABELS = [
 const SKIP_WORDS = ['跳過', '無', '沒有', 'skip', 'no', '不用'];
 
 const HELP_TEXT = [
-  '**用法**：直接傳「事件名稱」給我，我會依序問 Due date、label、description，然後建進 Plane。',
+  '**用法（AI 模式，預設）**：直接丟一段自由文字給我（可以一次講幾件事），我會用 AI 抽出裡面的事件，列出確認卡讓你按按鈕確認，才會真的寫進 Plane。',
+  '- 也可以直接用自然語言查詢或刪除，例如「幫我刪掉8/1的古」「告訴我8/1有哪些行程」「8/12有微積分考試」；前綴 `查`/`刪` 是快速通道（不用等 AI）。',
+  '- 缺日期的事件，按確認後我會逐筆問你。文字看不出明確內容時，我可能會先反問一次澄清（最多一輪）。',
+  '- AI 暫時不可用時：短文字（40 字以內）會自動退回下面的「逐步模式」；長文字會請你稍後再試。',
   '',
-  '**Due date 格式**：',
+  '**逐步模式（AI 不可用時的備援）**：依序問 Due date、label、description，然後建進 Plane。',
+  '',
+  '**Due date 格式**（逐步模式或補日期時用）：',
   '- 單日：`7/30`、`2026-07-30`、`今天`、`明天`、`後天`',
-  '- 週期：`9/1到12/20的每個禮拜三`（範圍內每個週三各建一筆）',
+  '- 週期：`9/1到12/20的每個禮拜三`（範圍內每個週三各建一筆，僅逐步模式支援）',
   '',
-  'description 那步不想填就打 `跳過`。中途想放棄打 `取消`。',
+  '逐步模式的 description 那步不想填就打 `跳過`。中途想放棄打 `取消`（會清掉所有進行中的流程）。',
   '',
-  '**查詢**：`查 <日期/範圍/關鍵字>`（沒有進行中的建立流程時才會被當成查詢指令）',
+  '**查詢**：`查 <日期/範圍/關鍵字>`（沒有進行中的流程時才會被當成查詢指令）',
   '- 範圍：`查 8/1到8/7`、`查 8/1~8/7`',
   '- 單日：`查 8/1`、`查 今天`',
   '- 關鍵字：`查 ewant`（比對事件名稱）',
@@ -70,6 +76,29 @@ const sessions = new Map(); // userId -> { step: 'due'|'label'|'desc', name, dat
 const pendingDeletes = new Map();
 // 刪除候選清單（多筆待使用者用選單挑一筆）：userId -> { byId: Map(id -> issue), expiresAt }
 const pendingDeleteLists = new Map();
+
+// ===== AI 自由文字解析的暫存狀態（BOT-AI-INTAKE-SPEC.md） =====
+// 進行中的 AI 呼叫鎖：userId -> true（同一使用者同時只能有一個 claude -p 在跑）。
+const aiInFlight = new Set();
+// 世代計數器：userId -> number。「取消」或重新起一輪解析時遞增，讓已經送出但還沒回來的
+// 舊呼叫在 resolve 時能判斷自己已經過期，直接丟棄結果（不誤更新使用者看到的畫面）。
+const aiGeneration = new Map();
+function bumpAiGeneration(userId) {
+  const next = (aiGeneration.get(userId) || 0) + 1;
+  aiGeneration.set(userId, next);
+  return next;
+}
+// 等待使用者輸入的三種 AI 流程狀態，userId -> 下列其中一種（phase 互斥，清除時務必連 aiInFlight 一起清）：
+//   { phase: 'clarify', originalText, questions, expiresAt }                      —— 等待澄清回答
+//   { phase: 'confirm', events, expiresAt }                                       —— 等待按確認卡按鈕
+//   { phase: 'dateFill', events, pendingIndices, cursor, expiresAt }              —— 逐筆補缺的 due
+const aiFlows = new Map();
+function clearAiState(userId) {
+  sessions.delete(userId);
+  aiFlows.delete(userId);
+  aiInFlight.delete(userId);
+  bumpAiGeneration(userId);
+}
 
 // ===== 日期工具 =====
 const fmt = (d) =>
@@ -173,7 +202,30 @@ function matchesQuery(issue, q) {
   if (q.type === 'range') {
     return !!issue.target_date && issue.target_date >= q.start && issue.target_date <= q.end;
   }
+  if (q.type === 'both') {
+    const inRange = !!issue.target_date && issue.target_date >= q.start && issue.target_date <= q.end;
+    return inRange && issue.name.includes(q.keyword);
+  }
   return issue.name.includes(q.keyword);
+}
+
+// AI 意圖分類（BOT-AI-INTENT-SPEC.md）的 query 物件（{start,end,keyword}）轉成上面 matchesQuery 吃的
+// 既有內部格式。日期＋關鍵字兩者兼有時用新的 'both' type（先範圍後關鍵字，AND 過濾）——這是既有
+// parseQueryInput 只會產生 range 或 keyword 其中一種所做不到的組合，過濾邏輯統一收在 matchesQuery 內，
+// 不重複實作。回傳 null 代表兩者都沒有（正常不會走到，ai-intake.js 的決定性驗證已擋掉這種情況）。
+function aiQueryToInternal(q) {
+  const hasDate = !!(q && (q.start || q.end));
+  const hasKeyword = !!(q && q.keyword);
+  if (hasDate && hasKeyword) {
+    return { type: 'both', start: q.start || q.end, end: q.end || q.start, keyword: q.keyword };
+  }
+  if (hasDate) {
+    return { type: 'range', start: q.start || q.end, end: q.end || q.start };
+  }
+  if (hasKeyword) {
+    return { type: 'keyword', keyword: q.keyword };
+  }
+  return null;
 }
 
 // 給訊息標題用的日期顯示（不補零，例：8/1 ~ 8/7）
@@ -193,6 +245,10 @@ function mdPadded(dateStr) {
 function describeQuery(q) {
   if (q.type === 'range') {
     return q.start === q.end ? mdShort(q.start) : `${mdShort(q.start)} ~ ${mdShort(q.end)}`;
+  }
+  if (q.type === 'both') {
+    const dateLabel = q.start === q.end ? mdShort(q.start) : `${mdShort(q.start)} ~ ${mdShort(q.end)}`;
+    return `${dateLabel}「${q.keyword}」`;
   }
   return `「${q.keyword}」`;
 }
@@ -342,29 +398,304 @@ async function finishCreate(session, desc, replyFn) {
   return replyFn(lines.join('\n'));
 }
 
-// ===== 查詢（`查 ...`） =====
-async function handleQuery(msg, argText) {
+// ===== AI 自由文字建立（BOT-AI-INTAKE-SPEC.md） =====
+
+// 逐步模式的起手式（原本是「非指令訊息」的預設行為，AI 上線後改為 AI 解析失敗時的 fallback）。
+function startStepwiseSession(userId, text) {
+  sessions.set(userId, { step: 'due', name: text });
+  const now = new Date();
+  const todayLabel = `${now.getMonth() + 1}/${now.getDate()}（週${'日一二三四五六'[now.getDay()]}）`;
+  return [
+    `要建立事件「**${text}**」。`,
+    `📅 Due date 是哪天？（今天是 ${todayLabel}）`,
+    '單日：`7/30`、`2026-07-30`、`今天`、`明天`',
+    '週期：`9/1到12/20的每個禮拜三`',
+  ].join('\n');
+}
+
+// AI 不可用（spawn 失敗／逾時／二次 JSON 修復仍失敗）時的 fallback：短文字轉逐步模式，長文字請重試。
+function aiFallbackContent(userId, originalText) {
+  if (originalText.length <= 40) {
+    return ['⚠️ AI 解析暫時不可用，改用逐步模式。', startStepwiseSession(userId, originalText)].join('\n');
+  }
+  return '⚠️ AI 解析暫時不可用，請稍後再試，或改用逐步模式（傳簡短事件名稱，40 字以內）。';
+}
+
+// 依日期升冪排序；沒有日期（❓需要日期）排最後。
+function sortEventsForCard(events) {
+  return [...events].sort((a, b) => {
+    const da = a.due || '9999-99-99';
+    const db = b.due || '9999-99-99';
+    return da < db ? -1 : da > db ? 1 : 0;
+  });
+}
+
+function labelInfoFor(labelName) {
+  return LABELS.find((l) => l.name === labelName) || LABELS.find((l) => l.name === 'remind');
+}
+
+function cardLineFor(ev, idx, todayIso) {
+  const info = labelInfoFor(ev.label || 'remind');
+  const labelSuffix = ev.label ? '' : '（預設）';
+  let dueDisplay;
+  if (!ev.due) dueDisplay = '❓需要日期';
+  else if (ev.due < todayIso) dueDisplay = `⚠️ ${ev.due}（已過去）`;
+  else dueDisplay = ev.due;
+  return `${idx + 1}. ${info.emoji ? info.emoji + ' ' : ''}${ev.name} — ${dueDisplay}${labelSuffix}`;
+}
+
+// 組確認卡文字。若顯示不完整（超過 Discord 2000 字上限）不做截斷顯示——寧可拒絕也不能讓使用者
+// 在沒看到全部內容的情況下按下確認鈕，回傳 tooLong 讓呼叫端改請使用者分段丟文字。
+function buildConfirmCard(events) {
+  const sorted = sortEventsForCard(events);
+  const todayIso = taipeiTodayInfo().iso;
+  const header = `🤖 從你的文字抽出 ${events.length} 筆事件：`;
+  const lines = sorted.map((e, i) => cardLineFor(e, i, todayIso));
+  const text = [header, ...lines].join('\n');
+  if (text.length > 1900) return { tooLong: true, events: sorted };
+  return { tooLong: false, text, events: sorted };
+}
+
+function buildAiConfirmRow(userId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`plane_ai_ok:${userId}`).setLabel('✅ 全部建立').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`plane_ai_no:${userId}`).setLabel('❌ 取消').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+// 確認後逐筆建立（依日期升冪）；emoji 前綴規則與既有建立流程一致；筆間 sleep(400)。
+// 結果只憑 POST 回應判斷成功/失敗，不轉述 AI 的說法。
+async function createAiEvents(events) {
+  const sorted = sortEventsForCard(events);
+  const results = [];
+  for (const ev of sorted) {
+    const label = labelInfoFor(ev.label || 'remind');
+    const finalName = label.emoji ? `${label.emoji} ${ev.name}` : ev.name;
+    try {
+      const issue = await createPlaneIssue({ name: finalName, due: ev.due, label, desc: ev.desc || '' });
+      // 成功回報一律取 POST 回應的欄位（不用 AI 事件物件），失敗回報才用送出值描述目標
+      results.push({ ok: true, name: issue.name, due: issue.target_date, id: issue.id });
+    } catch (err) {
+      results.push({ ok: false, name: finalName, due: ev.due, error: err.message });
+    }
+    if (sorted.length > 1) await sleep(400);
+  }
+  return results;
+}
+
+function buildAiCreateReport(results) {
+  const okCount = results.filter((r) => r.ok).length;
+  const failCount = results.length - okCount;
+  const lines = [`✅ 已建立 ${okCount}/${results.length} 筆事件：`];
+  for (const r of results) {
+    lines.push(r.ok ? `- ${r.name} — ${r.due}｜${issueUrl(r.id)}` : `- ❌ ${r.name} — ${r.due}｜失敗：${r.error}`);
+  }
+  if (failCount > 0) lines.push('', `⚠️ ${failCount} 筆失敗，請人工確認 Plane 上的實際狀態。`);
+  lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
+  return lines.join('\n');
+}
+
+// AI 解析成功、沒有需要澄清的問題之後：events 為空 → 明確告知；否則出確認卡。
+async function presentAiConfirmOrEmpty(placeholder, userId, events, originalText) {
+  if (events.length === 0) {
+    aiFlows.delete(userId);
+    return placeholder.edit(
+      `🤖 我看不出這段文字裡有事件（原文共 ${originalText.length} 字）。可以換個說法，或直接傳簡短事件名稱走逐步模式。`
+    );
+  }
+  const card = buildConfirmCard(events);
+  if (card.tooLong) {
+    aiFlows.delete(userId);
+    return placeholder.edit(
+      `🤖 抽出 ${events.length} 筆事件，但確認卡太長顯示不完整——為了不讓你在沒看到全部內容的情況下按確認，這次先不繼續，麻煩把文字拆成幾段分別丟給我。`
+    );
+  }
+  aiFlows.set(userId, { phase: 'confirm', events: card.events, expiresAt: Date.now() + 120_000 });
+  return placeholder.edit({ content: card.text, components: [buildAiConfirmRow(userId)] });
+}
+
+// 依 intent 分派到既有的決定性管線（BOT-AI-INTENT-SPEC.md §管線接軌）：
+// query/delete 只餵「使用者想查/刪什麼」的參數給既有核心，AI 完全碰不到查詢結果內容與刪除執行路徑；
+// create 走 v2 的確認卡流程；unknown 給一句提示。originalMsg 必須是使用者本人發的訊息物件
+// （runAiDelete 需要正確的 author.id 來鍵值 pendingDeletes/pendingDeleteLists）。
+async function dispatchByIntent(placeholder, originalMsg, userId, normalized, originalText) {
+  const { intent, query, events } = normalized;
+  if (intent === 'query') return runAiQuery(placeholder, query);
+  if (intent === 'delete') return runAiDelete(placeholder, originalMsg, query);
+  if (intent === 'unknown') {
+    return placeholder.edit(
+      ['🤖 看不出你要建立、查詢還是刪除。', '可以說「幫我刪掉8/1的古」「告訴我8/1有哪些行程」「8/12有微積分考試」。'].join('\n')
+    );
+  }
+  return presentAiConfirmOrEmpty(placeholder, userId, events, originalText);
+}
+
+// AI 解析結果：questions 非空 → 進入澄清狀態等回答（連同這輪判斷的 intent 一併存起來，避免澄清後
+// 重新解析時意圖漂移）；否則直接依 intent 分派。
+async function handleAiOutcome(placeholder, originalMsg, userId, normalized, originalText) {
+  const { intent, questions } = normalized;
+  if (questions.length > 0) {
+    aiFlows.set(userId, { phase: 'clarify', originalText, questions, intent, expiresAt: Date.now() + 120_000 });
+    const qList = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+    return placeholder.edit(
+      ['🤖 有幾個地方要跟你確認：', qList, '', '請直接回覆（一則訊息即可）；輸入 `取消` 可放棄本次。'].join('\n')
+    );
+  }
+  return dispatchByIntent(placeholder, originalMsg, userId, normalized, originalText);
+}
+
+// 非指令訊息的預設路徑：立即回 placeholder → 呼叫 AI → edit 同一則訊息成結果。
+async function startAiParse(msg, text) {
+  const userId = msg.author.id;
+  const myGen = bumpAiGeneration(userId);
+  aiInFlight.add(userId);
+  const placeholder = await msg.reply('🤖 解析中…（約 10–20 秒）');
+  const result = await runAiParse({ userText: text });
+  aiInFlight.delete(userId);
+  if (aiGeneration.get(userId) !== myGen) return; // 已被取消或有新一輪蓋過，捨棄這次結果
+
+  if (!result.ok) {
+    console.error('[bot] AI 解析失敗:', result.error);
+    return placeholder.edit(aiFallbackContent(userId, text));
+  }
+  return handleAiOutcome(placeholder, msg, userId, result, text);
+}
+
+// 澄清回答（phase: 'clarify'）：原文＋問題＋這次回答＋第一輪的 intent 重新丟 AI，最多一輪，之後不管
+// 有什麼都直接依 intent 分派，不再反問。
+async function handleClarifyAnswer(msg, flow) {
+  const userId = msg.author.id;
+  if (Date.now() > flow.expiresAt) {
+    aiFlows.delete(userId);
+    return msg.reply('⌛ 已過期，請重新傳一次原文。');
+  }
+  aiFlows.delete(userId);
+  const myGen = bumpAiGeneration(userId);
+  aiInFlight.add(userId);
+  const placeholder = await msg.reply('🤖 解析中…（約 10–20 秒）');
+  const result = await runAiParse({
+    userText: flow.originalText,
+    clarify: { questions: flow.questions, answer: msg.content.trim(), intent: flow.intent },
+  });
+  aiInFlight.delete(userId);
+  if (aiGeneration.get(userId) !== myGen) return;
+
+  if (!result.ok) {
+    console.error('[bot] AI 澄清解析失敗:', result.error);
+    return placeholder.edit(aiFallbackContent(userId, flow.originalText));
+  }
+  return dispatchByIntent(placeholder, msg, userId, result, flow.originalText);
+}
+
+// 逐筆補缺日期（phase: 'dateFill'，按下確認鈕之後才會進入）：用既有 parseSingleDate 決定性解析。
+async function handleDateFillAnswer(msg, flow) {
+  const userId = msg.author.id;
+  if (Date.now() > flow.expiresAt) {
+    aiFlows.delete(userId);
+    return msg.reply('⌛ 已過期，請重新傳一次原文。');
+  }
+  const text = msg.content.trim();
+  const idx = flow.pendingIndices[flow.cursor];
+  const d = parseSingleDate(text, true);
+  if (!d) {
+    return msg.reply('看不懂這個日期 😅 可用：`7/30`、`2026-07-30`、`今天`、`明天`，或輸入 `取消`。');
+  }
+  flow.events[idx].due = fmt(d);
+  flow.cursor += 1;
+
+  if (flow.cursor < flow.pendingIndices.length) {
+    flow.expiresAt = Date.now() + 120_000;
+    const nextIdx = flow.pendingIndices[flow.cursor];
+    return msg.reply(`📅 「${flow.events[nextIdx].name}」是哪天？（可用 7/30、2026-07-30、今天、明天）`);
+  }
+
+  aiFlows.delete(userId);
+  await msg.reply(`⏳ 建立 ${flow.events.length} 筆中…`);
+  const results = await createAiEvents(flow.events);
+  return msg.reply(buildAiCreateReport(results));
+}
+
+// 三種等待中的 AI 流程狀態的訊息分派（confirm 階段是按鈕驅動，文字訊息只提醒去按鈕）。
+function handleAiFlowMessage(msg, flow) {
+  if (flow.phase === 'clarify') return handleClarifyAnswer(msg, flow);
+  if (flow.phase === 'dateFill') return handleDateFillAnswer(msg, flow);
+  if (flow.phase === 'confirm') {
+    return msg.reply('請按上面的「✅ 全部建立」或「❌ 取消」按鈕，或輸入 `取消` 放棄。');
+  }
+  return msg.reply('狀態異常，已重置，請重新傳文字給我。'); // 防禦性，理論上不會走到
+}
+
+// 按下確認卡「✅ 全部建立」：若有缺日期的事件先逐筆問，問完才真正建立。
+async function handleAiConfirmOk(interaction) {
+  const authorId = interaction.customId.slice('plane_ai_ok:'.length);
+  if (interaction.user.id !== authorId) {
+    return interaction.reply({ content: '這張確認卡不是給你的。', ephemeral: true });
+  }
+  const flow = aiFlows.get(authorId);
+  if (!flow || flow.phase !== 'confirm' || Date.now() > flow.expiresAt) {
+    aiFlows.delete(authorId);
+    return interaction.update({ content: '已過期，請重新傳一次原文。', components: [] });
+  }
+
+  const missingIdx = flow.events.map((e, i) => (e.due ? -1 : i)).filter((i) => i !== -1);
+  if (missingIdx.length > 0) {
+    aiFlows.set(authorId, { phase: 'dateFill', events: flow.events, pendingIndices: missingIdx, cursor: 0, expiresAt: Date.now() + 120_000 });
+    const firstIdx = missingIdx[0];
+    return interaction.update({
+      content: `✅ 收到，還有 ${missingIdx.length} 筆缺日期。\n📅 「${flow.events[firstIdx].name}」是哪天？（可用 7/30、2026-07-30、今天、明天）`,
+      components: [],
+    });
+  }
+
+  aiFlows.delete(authorId);
+  await interaction.update({ content: `⏳ 建立 ${flow.events.length} 筆中…`, components: [] });
+  const results = await createAiEvents(flow.events);
+  return interaction.editReply(buildAiCreateReport(results));
+}
+
+async function handleAiConfirmNo(interaction) {
+  const authorId = interaction.customId.slice('plane_ai_no:'.length);
+  if (interaction.user.id !== authorId) {
+    return interaction.reply({ content: '這張確認卡不是給你的。', ephemeral: true });
+  }
+  aiFlows.delete(authorId);
+  return interaction.update({ content: '已取消，這批不會建立。', components: [] });
+}
+
+// ===== 查詢（`查 ...` 與 AI intent=query 共用核心） =====
+// 抓取＋過濾＋組訊息文字，回傳字串本身（不送出），呼叫端決定要 msg.reply 還是 placeholder.edit——
+// 這樣前綴路徑與 AI 路徑餵同一個 q 物件時輸出保證逐字元一致（BOT-AI-INTENT-SPEC.md 驗收條件 2）。
+async function buildQueryReplyContent(q) {
   try {
-    const q = parseQueryInput(argText);
     const issues = await fetchAllIssues();
     const matched = issues.filter((i) => matchesQuery(i, q)).sort(byTargetDateAsc);
     const headerLabel = describeQuery(q);
 
     if (matched.length === 0) {
-      return msg.reply(
-        q.type === 'keyword'
-          ? `📋 「${q.keyword}」沒有符合的事件。`
-          : `📋 ${headerLabel} 這個範圍沒有事件。`
-      );
+      if (q.type === 'keyword') return `📋 「${q.keyword}」沒有符合的事件。`;
+      if (q.type === 'both') return `📋 ${headerLabel} 沒有符合的事件。`;
+      return `📋 ${headerLabel} 這個範圍沒有事件。`;
     }
 
     const lines = matched.map((i) => `${mdPadded(i.target_date)} ${i.name}  [${i.id.slice(0, 8)}]`);
     const header = `📋 ${headerLabel} 共 ${matched.length} 筆：`;
-    return msg.reply(buildListMessage(header, lines));
+    return buildListMessage(header, lines);
   } catch (err) {
     console.error('[bot] handleQuery error:', err);
-    return msg.reply(`❌ 查詢失敗：${err.message}`);
+    return `❌ 查詢失敗：${err.message}`;
   }
+}
+
+async function handleQuery(msg, argText) {
+  const content = await buildQueryReplyContent(parseQueryInput(argText));
+  return msg.reply(content);
+}
+
+// AI intent=query：把 AI 的 query 物件轉成內部格式，餵同一個核心，edit 掉「解析中」placeholder。
+async function runAiQuery(placeholder, aiQuery) {
+  const q = aiQueryToInternal(aiQuery) || { type: 'keyword', keyword: '' };
+  const content = await buildQueryReplyContent(q);
+  return placeholder.edit(content);
 }
 
 // ===== 刪除（`刪 ...`） =====
@@ -410,6 +741,12 @@ function presentDeleteChoices(msg, issues) {
   });
 }
 
+// 抓取＋過濾＋排序（查詢與刪除的候選比對邏輯共用，不重複實作）。
+async function resolveDeleteMatches(q) {
+  const issues = await fetchAllIssues();
+  return issues.filter((i) => matchesQuery(i, q)).sort(byTargetDateAsc);
+}
+
 async function handleDelete(msg, argText) {
   if (!process.env.ALLOWED_USER_ID) {
     return msg.reply('⚠️ 刪除功能目前停用：請先在 `.env` 設定 `ALLOWED_USER_ID`（填入你的 Discord user id）後再試一次。');
@@ -417,8 +754,7 @@ async function handleDelete(msg, argText) {
 
   try {
     const q = parseQueryInput(argText);
-    const issues = await fetchAllIssues();
-    const matched = issues.filter((i) => matchesQuery(i, q)).sort(byTargetDateAsc);
+    const matched = await resolveDeleteMatches(q);
 
     if (matched.length === 0) {
       return msg.reply(`🔍 找不到符合「${argText}」的事件。`);
@@ -433,6 +769,33 @@ async function handleDelete(msg, argText) {
   } catch (err) {
     console.error('[bot] handleDelete error:', err);
     return msg.reply(`❌ 刪除流程出錯：${err.message}`);
+  }
+}
+
+// AI intent=delete：候選/選單/確認/read-back 全部沿用既有核心（presentDeleteConfirm/presentDeleteChoices
+// 走的就是 pendingDeletes/pendingDeleteLists 那套 60 秒過期＋按鈕確認＋DELETE 後 read-back），AI 只碰得到
+// 「篩出候選」這一步，碰不到刪除執行路徑本身。originalMsg 必須是使用者本人發的訊息物件（不能傳 placeholder，
+// 否則 presentDeleteConfirm 內部用來鍵值 pendingDeletes 的 msg.author.id 會變成 bot 自己的 id）。
+async function runAiDelete(placeholder, originalMsg, aiQuery) {
+  if (!process.env.ALLOWED_USER_ID) {
+    return placeholder.edit('⚠️ 刪除功能目前停用：請先在 `.env` 設定 `ALLOWED_USER_ID`（填入你的 Discord user id）後再試一次。');
+  }
+  const q = aiQueryToInternal(aiQuery) || { type: 'keyword', keyword: '' };
+  const label = describeQuery(q);
+  try {
+    const matched = await resolveDeleteMatches(q);
+    if (matched.length === 0) {
+      return placeholder.edit(`🔍 找不到符合「${label}」的事件。`);
+    }
+    if (matched.length > 25) {
+      return placeholder.edit(`🔍 找到 ${matched.length} 筆符合的事件，超過選單上限 25 筆，請縮小範圍再試一次。`);
+    }
+    await placeholder.edit(`🔍 找到符合「${label}」的事件，請看下面：`);
+    if (matched.length === 1) return presentDeleteConfirm(originalMsg, matched[0]);
+    return presentDeleteChoices(originalMsg, matched);
+  } catch (err) {
+    console.error('[bot] handleDelete error:', err);
+    return placeholder.edit(`❌ 刪除流程出錯：${err.message}`);
   }
 }
 
@@ -538,77 +901,80 @@ client.on('messageCreate', async (msg) => {
     if (!text) return;
 
     if (text === '取消' || text.toLowerCase() === 'cancel') {
-      sessions.delete(msg.author.id);
-      return msg.reply('已取消，隨時再傳事件名稱給我。');
+      clearAiState(msg.author.id);
+      return msg.reply('已取消，隨時再丟文字給我。');
     }
     if (text === '幫助' || text.toLowerCase() === 'help') {
       return msg.reply(HELP_TEXT);
     }
 
+    // 逐步模式（既有 due/label/desc 流程，行為不變；現在只透過 AI fallback 進入）優先處理，
+    // 因為它一旦開始，接下來的每則訊息都是該流程的輸入值。
     const session = sessions.get(msg.author.id);
-
-    if (!session) {
-      // 「查」「刪」只在沒有進行中的建立流程時才攔截，避免吃掉 due/label/desc 步驟的輸入
-      // （使用者若想中途查詢／刪除，要先打「取消」）。
-      const queryMatch = text.match(/^查\s+(.+)$/);
-      if (queryMatch) return handleQuery(msg, queryMatch[1].trim());
-
-      const delMatch = text.match(/^刪\s+(.+)$/);
-      if (delMatch) return handleDelete(msg, delMatch[1].trim());
-
-      sessions.set(msg.author.id, { step: 'due', name: text });
-      return msg.reply(
-        [
-          `要建立事件「**${text}**」。`,
-          '📅 Due date 是哪天？',
-          '單日：`7/30`、`2026-07-30`、`今天`、`明天`',
-          '週期：`9/1到12/20的每個禮拜三`',
-        ].join('\n')
-      );
-    }
-
-    if (session.step === 'due') {
-      const parsed = parseDueInput(text);
-      if (!parsed) {
-        return msg.reply(
-          '看不懂這個日期 😅 可用：`7/30`、`2026-07-30`、`今天`、`明天`，或 `9/1到12/20的每個禮拜三`，或打 `取消`。'
-        );
+    if (session) {
+      if (session.step === 'due') {
+        const parsed = parseDueInput(text);
+        if (!parsed) {
+          return msg.reply(
+            '看不懂這個日期 😅 可用：`7/30`、`2026-07-30`、`今天`、`明天`，或 `9/1到12/20的每個禮拜三`，或打 `取消`。'
+          );
+        }
+        if (parsed.error) return msg.reply(`⚠️ ${parsed.error}`);
+        session.dates = parsed.dates;
+        session.dueLabel = parsed.dueLabel;
+        session.step = 'label';
+        return msg.reply({
+          content: `📅 Due date：**${parsed.dueLabel}**\n🏷️ 要掛哪個 label？（也可以直接打字，例如 \`test\`）`,
+          components: [labelMenu()],
+        });
       }
-      if (parsed.error) return msg.reply(`⚠️ ${parsed.error}`);
-      session.dates = parsed.dates;
-      session.dueLabel = parsed.dueLabel;
-      session.step = 'label';
-      return msg.reply({
-        content: `📅 Due date：**${parsed.dueLabel}**\n🏷️ 要掛哪個 label？（也可以直接打字，例如 \`test\`）`,
-        components: [labelMenu()],
-      });
+
+      if (session.step === 'label') {
+        const typed = LABELS.find((l) => l.name.toLowerCase() === text.toLowerCase());
+        if (!typed) {
+          return msg.reply(
+            `沒有「${text}」這個 label。可用：${LABELS.map((l) => l.name).join('、')}，或用上面的選單選。`
+          );
+        }
+        session.label = typed;
+        session.step = 'desc';
+        return msg.reply(askDescText(session));
+      }
+
+      if (session.step === 'desc') {
+        const desc = SKIP_WORDS.includes(text.toLowerCase()) ? '' : msg.content.trim();
+        sessions.delete(msg.author.id);
+        if (session.dates.length > 1) {
+          await msg.reply(`⏳ 建立 ${session.dates.length} 筆中…`);
+        }
+        return finishCreate(session, desc, (content) => msg.reply(content));
+      }
+      return; // 防禦性，理論上不會走到（session.step 只會是上述三值之一）
     }
 
-    if (session.step === 'label') {
-      const typed = LABELS.find((l) => l.name.toLowerCase() === text.toLowerCase());
-      if (!typed) {
-        return msg.reply(
-          `沒有「${text}」這個 label。可用：${LABELS.map((l) => l.name).join('、')}，或用上面的選單選。`
-        );
-      }
-      session.label = typed;
-      session.step = 'desc';
-      return msg.reply(askDescText(session));
+    // AI 流程等待使用者輸入的三種狀態（clarify/confirm/dateFill）優先於「查」「刪」與新一輪解析。
+    const flow = aiFlows.get(msg.author.id);
+    if (flow) return handleAiFlowMessage(msg, flow);
+
+    // 已有一輪 AI 呼叫在跑，還沒回來——不要再開一輪，避免重複呼叫 claude -p。
+    if (aiInFlight.has(msg.author.id)) {
+      return msg.reply('⏳ 上一段還在解析中，請稍等一下下（約 10–20 秒），或輸入 `取消` 中止。');
     }
 
-    if (session.step === 'desc') {
-      const desc = SKIP_WORDS.includes(text.toLowerCase()) ? '' : msg.content.trim();
-      sessions.delete(msg.author.id);
-      if (session.dates.length > 1) {
-        await msg.reply(`⏳ 建立 ${session.dates.length} 筆中…`);
-      }
-      return finishCreate(session, desc, (content) => msg.reply(content));
-    }
+    // 「查」「刪」只在沒有任何進行中流程時才攔截，避免吃掉其他狀態的輸入。
+    const queryMatch = text.match(/^查\s+(.+)$/);
+    if (queryMatch) return handleQuery(msg, queryMatch[1].trim());
+
+    const delMatch = text.match(/^刪\s+(.+)$/);
+    if (delMatch) return handleDelete(msg, delMatch[1].trim());
+
+    // 預設路徑：非指令訊息一律走 AI 解析（BOT-AI-INTAKE-SPEC.md）。
+    return startAiParse(msg, text);
   } catch (err) {
     console.error('[bot] messageCreate error:', err);
-    sessions.delete(msg.author.id);
+    clearAiState(msg.author.id);
     try {
-      await msg.reply(`❌ 建立失敗：${err.message}\n請重新傳事件名稱再試一次。`);
+      await msg.reply(`❌ 建立失敗：${err.message}\n請重新傳一次再試。`);
     } catch (_) {}
   }
 });
@@ -619,7 +985,9 @@ client.on('interactionCreate', async (interaction) => {
     const isDeletePick = interaction.isStringSelectMenu() && interaction.customId === 'plane_del_pick';
     const isDeleteOk = interaction.isButton() && interaction.customId.startsWith('plane_del_ok:');
     const isDeleteNo = interaction.isButton() && interaction.customId === 'plane_del_no';
-    if (!isLabelSelect && !isDeletePick && !isDeleteOk && !isDeleteNo) return;
+    const isAiOk = interaction.isButton() && interaction.customId.startsWith('plane_ai_ok:');
+    const isAiNo = interaction.isButton() && interaction.customId.startsWith('plane_ai_no:');
+    if (!isLabelSelect && !isDeletePick && !isDeleteOk && !isDeleteNo && !isAiOk && !isAiNo) return;
 
     if (process.env.ALLOWED_CHANNEL_ID && interaction.channelId !== process.env.ALLOWED_CHANNEL_ID) return;
     if (process.env.ALLOWED_USER_ID && interaction.user.id !== process.env.ALLOWED_USER_ID) {
@@ -645,11 +1013,14 @@ client.on('interactionCreate', async (interaction) => {
     if (isDeletePick) return handleDeletePick(interaction);
     if (isDeleteOk) return handleDeleteConfirm(interaction);
     if (isDeleteNo) return handleDeleteCancel(interaction);
+    if (isAiOk) return handleAiConfirmOk(interaction);
+    if (isAiNo) return handleAiConfirmNo(interaction);
   } catch (err) {
     console.error('[bot] interactionCreate error:', err);
     sessions.delete(interaction.user.id);
     pendingDeletes.delete(interaction.user.id);
     pendingDeleteLists.delete(interaction.user.id);
+    aiFlows.delete(interaction.user.id);
     try {
       await interaction.followUp({ content: `❌ 出錯了：${err.message}`, ephemeral: true });
     } catch (_) {}
@@ -664,6 +1035,13 @@ if (require.main === module) {
     process.exit(1);
   }
   client.login(process.env.DISCORD_TOKEN);
+
+  // v1（AI intake）：Windows shell:true 呼叫 claude -p 的子行程不會跟著父行程一起死，
+  // Ctrl+C／關機時主動收割，避免殭屍行程吃記憶體與訂閱額度（learning bot 2026-07-09 實案教訓）。
+  process.on('SIGINT', () => {
+    killActiveClaudeChildren();
+    process.exit(0);
+  });
 }
 
 module.exports = {
@@ -684,4 +1062,23 @@ module.exports = {
   deletePlaneIssue, // 測試用：清理測試資料
   pendingDeletes, // 測試用：可直接操作 expiresAt 驗證 60 秒過期邏輯，不用真的等 60 秒
   client, // 測試用：可直接 client.emit(...) 觸發真正註冊的 messageCreate/interactionCreate handler 做回歸測試
+  // ↓ AI intake（BOT-AI-INTAKE-SPEC.md）新增匯出，供測試/驗收使用
+  sortEventsForCard,
+  buildConfirmCard,
+  createAiEvents, // 測試用：走真實 Plane API 建立/驗證多筆事件
+  buildAiCreateReport,
+  startStepwiseSession,
+  aiFallbackContent,
+  clearAiState,
+  aiFlows, // 測試用：可直接操作 expiresAt 驗證 120 秒過期邏輯，不用真的等
+  aiInFlight,
+  aiGeneration,
+  // ↓ AI 意圖分類（BOT-AI-INTENT-SPEC.md）新增匯出，供測試/驗收使用
+  aiQueryToInternal,
+  buildQueryReplyContent,
+  resolveDeleteMatches,
+  runAiQuery,
+  runAiDelete,
+  dispatchByIntent,
+  handleAiOutcome,
 };
