@@ -35,3 +35,7 @@ Windows 開機自動啟動：以工作排程器登入觸發執行 `start-bot-hid
 
 - `bot.js` 內的 workspace slug、project id、label id 為個人環境值，換環境需自行更新
 - `.env` 含機密，已列入 `.gitignore`，不要提交
+
+## License
+
+MIT — see [LICENSE](LICENSE).
