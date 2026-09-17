@@ -16,6 +16,7 @@ const {
   ButtonStyle,
 } = require('discord.js');
 const { runAiParse, killActiveClaudeChildren, taipeiTodayInfo } = require('./ai-intake');
+const { isE3Interaction, handleE3Interaction } = require('./e3-intake');
 
 // ===== Plane 設定 =====
 const PLANE = {
@@ -295,6 +296,23 @@ async function createPlaneIssue({ name, due, label, desc }) {
       method: 'POST',
       headers: { 'X-API-Key': PLANE.token, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Plane API ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+// 更新單筆 issue 的截止日（E3 候選卡的「期限變更」路徑用）；只送 target_date，非 2xx 丟出與 createPlaneIssue 同格式錯誤。
+async function updatePlaneIssue(issueId, { target_date }) {
+  const res = await fetch(
+    `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/${issueId}/`,
+    {
+      method: 'PATCH',
+      headers: { 'X-API-Key': PLANE.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_date }),
     }
   );
   if (!res.ok) {
@@ -981,6 +999,23 @@ client.on('messageCreate', async (msg) => {
 
 client.on('interactionCreate', async (interaction) => {
   try {
+    // E3 候選卡（BOT-E3-INTAKE-SPEC.md）：卡片在 #e3-bot，只檢查 ALLOWED_USER_ID、不套 ALLOWED_CHANNEL_ID
+    if (isE3Interaction(interaction)) {
+      if (process.env.ALLOWED_USER_ID && interaction.user.id !== process.env.ALLOWED_USER_ID) {
+        return interaction.reply({ content: '這個 bot 只服務它的主人 🙂', ephemeral: true });
+      }
+      return handleE3Interaction(interaction, {
+        createPlaneIssue,
+        updatePlaneIssue,
+        fetchAllIssues,
+        LABELS,
+        parseSingleDate,
+        fmt,
+        issueUrl,
+        log: console.log,
+      });
+    }
+
     const isLabelSelect = interaction.isStringSelectMenu() && interaction.customId === 'plane_label';
     const isDeletePick = interaction.isStringSelectMenu() && interaction.customId === 'plane_del_pick';
     const isDeleteOk = interaction.isButton() && interaction.customId.startsWith('plane_del_ok:');
@@ -1081,4 +1116,8 @@ module.exports = {
   runAiDelete,
   dispatchByIntent,
   handleAiOutcome,
+  // ↓ E3 候選卡（BOT-E3-INTAKE-SPEC.md）：e3-intake.js 的 deps 與 selftest-e3-intake.js 用
+  updatePlaneIssue, // 測試用：PATCH target_date，真實 API 只在端到端驗收時才碰
+  LABELS,
+  fmt,
 };
