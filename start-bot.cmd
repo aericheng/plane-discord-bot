@@ -1,9 +1,40 @@
 @echo off
-rem Plane Discord Bot launcher (ASCII only - see lessons re: Big5 codepage)
-rem Auto-restarts node if the bot crashes; 10s delay between restarts.
+rem Plane Discord Bot launcher (ASCII only - Big5 codepage parses this file)
+rem Restart loop with backoff: 30s between restarts; after 5 consecutive failures
+rem notify Discord and back off 10 minutes. Exit code 2 from bot.js = config error (stop loop).
+rem A run that lasted >= 600s counts as healthy: the consecutive-failure counter is reset
+rem before its exit is counted, so only rapid crash loops reach the alert (2026-09-29).
 set PATH=C:\Program Files\nodejs;%PATH%
-cd /d C:\Users\user\Desktop\dev\plane\plane-discord-bot
+cd /d "C:\Users\user\Desktop\dev\plane\plane-discord-bot"
+set /a fails=0
 :loop
+call :now t0
 "C:\Program Files\nodejs\node.exe" bot.js >> bot.log 2>&1
-ping -n 11 127.0.0.1 >nul
+set rc=%errorlevel%
+call :now t1
+set /a ran=t1-t0
+if %ran% LSS 0 set /a ran+=86400
+if "%rc%"=="2" (
+  echo [%date% %time%] bot exited with config error, loop stopped >> bot.log
+  goto end
+)
+if %ran% GEQ 600 set /a fails=0
+set /a fails+=1
+echo [%date% %time%] bot exited rc=%rc% after %ran%s, consecutive fails=%fails% >> bot.log
+if %fails% GEQ 5 (
+  "C:\Program Files\nodejs\node.exe" scripts\notify-fail.js "restarted %fails% times in a row, backing off 10 min (last rc=%rc%)" >> bot.log 2>&1
+  set /a fails=0
+  ping -n 601 127.0.0.1 >nul
+) else (
+  ping -n 31 127.0.0.1 >nul
+)
 goto loop
+
+:now
+rem Seconds since midnight into the variable named by %1. %time% is HH:mm:ss.ff with a
+rem leading space for hours below 10; the 1xx-100 trick avoids octal parsing of 08/09.
+set t=%time: =0%
+for /f "tokens=1-3 delims=:." %%a in ("%t%") do set /a %1=(1%%a-100)*3600+(1%%b-100)*60+(1%%c-100)
+exit /b 0
+
+:end

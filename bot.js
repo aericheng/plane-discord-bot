@@ -18,6 +18,17 @@ const {
 const { runAiParse, killActiveClaudeChildren, taipeiTodayInfo } = require('./ai-intake');
 const { isE3Interaction, handleE3Interaction } = require('./e3-intake');
 
+// 全域錯誤 handler：單一 promise 失敗只記 log；同步例外記 log 後以 exit 1 結束交給 start-bot.cmd 重啟
+process.on('unhandledRejection', (reason) => {
+  console.error('[bot] unhandledRejection:', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[bot] uncaughtException:', err && err.stack ? err.stack : err);
+  try { killActiveClaudeChildren(); } catch (_) {}
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 2000).unref();
+});
+
 // ===== Plane 設定 =====
 const PLANE = {
   apiBase: 'https://api.plane.so/api/v1',
@@ -905,6 +916,11 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
+client.on('error', (err) => console.error('[bot] discord client error:', err && err.stack ? err.stack : err));
+client.on('shardDisconnect', (ev, id) => console.warn(`[bot] shard ${id} disconnected code=${ev && ev.code}`));
+client.on('shardResume', (id) => console.log(`[bot] shard ${id} resumed`));
+client.on('warn', (m) => console.warn('[bot] discord warn:', m));
+
 client.on('clientReady', () => {
   console.log(`[bot] logged in as ${client.user.tag} at ${new Date().toISOString()}`);
 });
@@ -1066,10 +1082,13 @@ client.on('interactionCreate', async (interaction) => {
 // 讓下面純函式（日期解析、查詢過濾、訊息組字）可以被單獨測試。
 if (require.main === module) {
   if (!process.env.DISCORD_TOKEN || process.env.DISCORD_TOKEN === 'PUT_YOUR_DISCORD_BOT_TOKEN_HERE') {
-    console.error('[bot] DISCORD_TOKEN not set in .env — get one from https://discord.com/developers/applications');
-    process.exit(1);
+    console.error('[bot] DISCORD_TOKEN not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — get one from https://discord.com/developers/applications');
+    process.exit(2);
   }
-  client.login(process.env.DISCORD_TOKEN);
+  client.login(process.env.DISCORD_TOKEN).catch((err) => {
+    console.error('[bot] login failed:', err && err.message ? err.message : err);
+    process.exit(err && err.code === 'TokenInvalid' ? 2 : 1);
+  });
 
   // v1（AI intake）：Windows shell:true 呼叫 claude -p 的子行程不會跟著父行程一起死，
   // Ctrl+C／關機時主動收割，避免殭屍行程吃記憶體與訂閱額度（learning bot 2026-07-09 實案教訓）。
