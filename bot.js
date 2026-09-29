@@ -307,6 +307,7 @@ async function createPlaneIssue({ name, due, label, desc }) {
       method: 'POST',
       headers: { 'X-API-Key': PLANE.token, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
     }
   );
   if (!res.ok) {
@@ -324,6 +325,7 @@ async function updatePlaneIssue(issueId, { target_date }) {
       method: 'PATCH',
       headers: { 'X-API-Key': PLANE.token, 'Content-Type': 'application/json' },
       body: JSON.stringify({ target_date }),
+      signal: AbortSignal.timeout(15000),
     }
   );
   if (!res.ok) {
@@ -347,7 +349,7 @@ async function fetchAllIssues() {
   let page = 0;
   while (true) {
     const url = `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/?per_page=100&cursor=100:${page}:0`;
-    const res = await fetch(url, { headers: { 'X-API-Key': PLANE.token } });
+    const res = await fetch(url, { headers: { 'X-API-Key': PLANE.token }, signal: AbortSignal.timeout(15000) });
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Plane API ${res.status}: ${text.slice(0, 300)}`);
@@ -364,7 +366,7 @@ async function fetchAllIssues() {
 async function deletePlaneIssue(issueId) {
   const res = await fetch(
     `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/${issueId}/`,
-    { method: 'DELETE', headers: { 'X-API-Key': PLANE.token } }
+    { method: 'DELETE', headers: { 'X-API-Key': PLANE.token }, signal: AbortSignal.timeout(15000) }
   );
   return res.status;
 }
@@ -374,7 +376,7 @@ async function deletePlaneIssue(issueId) {
 async function getPlaneIssue(issueId) {
   const res = await fetch(
     `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/${issueId}/`,
-    { headers: { 'X-API-Key': PLANE.token } }
+    { headers: { 'X-API-Key': PLANE.token }, signal: AbortSignal.timeout(15000) }
   );
   return res.status;
 }
