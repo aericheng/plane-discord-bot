@@ -5,6 +5,9 @@
 // 建好的事件會出現在 Plane，並由既有的 Apps Script 每小時同步進 Google 日曆。
 
 require('dotenv').config();
+const { installSplitting, installLogRedaction } = require('./discord-util');
+installLogRedaction();
+installSplitting(require('discord.js'));
 const {
   Client,
   GatewayIntentBits,
@@ -1085,6 +1088,10 @@ client.on('interactionCreate', async (interaction) => {
 if (require.main === module) {
   if (!process.env.DISCORD_TOKEN || process.env.DISCORD_TOKEN === 'PUT_YOUR_DISCORD_BOT_TOKEN_HERE') {
     console.error('[bot] DISCORD_TOKEN not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — get one from https://discord.com/developers/applications');
+    process.exit(2);
+  }
+  if (!process.env.ALLOWED_USER_ID || !process.env.ALLOWED_USER_ID.trim()) {
+    console.error('[bot] ALLOWED_USER_ID not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — set ALLOWED_USER_ID=<your Discord user id>');
     process.exit(2);
   }
   client.login(process.env.DISCORD_TOKEN).catch((err) => {
