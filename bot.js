@@ -18,6 +18,7 @@ const {
   ButtonBuilder,
   ButtonStyle,
 } = require('discord.js');
+const crypto = require('node:crypto');
 const { runAiParse, killActiveClaudeChildren, taipeiTodayInfo } = require('./ai-intake');
 const { isE3Interaction, handleE3Interaction } = require('./e3-intake');
 
@@ -62,7 +63,8 @@ const SKIP_WORDS = ['跳過', '無', '沒有', 'skip', 'no', '不用'];
 const HELP_TEXT = [
   '**用法（AI 模式，預設）**：直接丟一段自由文字給我（可以一次講幾件事），我會用 AI 抽出裡面的事件，列出確認卡讓你按按鈕確認，才會真的寫進 Plane。',
   '- 也可以直接用自然語言查詢或刪除，例如「幫我刪掉8/1的古」「告訴我8/1有哪些行程」「8/12有微積分考試」；前綴 `查`/`刪` 是快速通道（不用等 AI）。',
-  '- 缺日期的事件，按確認後我會逐筆問你。文字看不出明確內容時，我可能會先反問一次澄清（最多一輪）。',
+  '- 確認卡 24 小時內按都有效（bot 重啟或打 `取消` 會讓它失效），擺著沒按也不影響你繼續丟新的文字。',
+  '- 缺日期的事件，按確認後我會逐筆問你。文字看不出明確內容時，我可能會先反問一次澄清（最多一輪）。這兩種「等你回答」的狀態 10 分鐘沒回就作廢，之後的訊息當新的一則處理。',
   '- AI 暫時不可用時：短文字（40 字以內）會自動退回下面的「逐步模式」；長文字會請你稍後再試。',
   '',
   '**逐步模式（AI 不可用時的備援）**：依序問 Due date、label、description，然後建進 Plane。',
@@ -103,15 +105,23 @@ function bumpAiGeneration(userId) {
   aiGeneration.set(userId, next);
   return next;
 }
-// 等待使用者輸入的三種 AI 流程狀態，userId -> 下列其中一種（phase 互斥，清除時務必連 aiInFlight 一起清）：
+// 「下一則訊息就是回答」的 AI 流程狀態，userId -> 下列其中一種（phase 互斥，清除時務必連 aiInFlight 一起清）：
 //   { phase: 'clarify', originalText, questions, expiresAt }                      —— 等待澄清回答
-//   { phase: 'confirm', events, expiresAt }                                       —— 等待按確認卡按鈕
 //   { phase: 'dateFill', events, pendingIndices, cursor, expiresAt }              —— 逐筆補缺的 due
+// 過期後不吃新訊息：下一則訊息直接當新的輸入處理（不再回「已過期」把使用者的新訊息丟掉）。
+const AI_REPLY_TTL_MS = 10 * 60_000;
+// 確認卡：cardId -> { userId, events, expiresAt }。卡片不佔 aiFlows，擺著沒按也不會擋住之後的訊息；
+// 按鈕 customId 帶 cardId，按哪張就建哪張卡上列出的事件，按過即消耗（連按兩下不會建兩次）。
+// 卡上已列出完整內容，晚點按不影響正確性，所以有效期給長（原本 120 秒，使用者常常回來按時已過期）。
+const pendingCards = new Map();
+const AI_CARD_TTL_MS = 24 * 60 * 60_000;
 const aiFlows = new Map();
-function clearAiState(userId) {
+// keepCards：錯誤處理時只重置對話狀態，不連帶作廢使用者還沒按的確認卡（「取消」指令才全清）。
+function clearAiState(userId, { keepCards = false } = {}) {
   sessions.delete(userId);
   aiFlows.delete(userId);
   aiInFlight.delete(userId);
+  if (!keepCards) for (const [cardId, card] of pendingCards) if (card.userId === userId) pendingCards.delete(cardId);
   bumpAiGeneration(userId);
 }
 
@@ -490,11 +500,17 @@ function buildConfirmCard(events) {
   return { tooLong: false, text, events: sorted };
 }
 
-function buildAiConfirmRow(userId) {
+function buildAiConfirmRow(userId, cardId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`plane_ai_ok:${userId}`).setLabel('✅ 全部建立').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`plane_ai_no:${userId}`).setLabel('❌ 取消').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`plane_ai_ok:${userId}:${cardId}`).setLabel('✅ 全部建立').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`plane_ai_no:${userId}:${cardId}`).setLabel('❌ 取消').setStyle(ButtonStyle.Secondary)
   );
+}
+
+// customId `plane_ai_ok:<userId>:<cardId>` → { authorId, cardId }（改版前發出的舊卡沒有 cardId，查不到卡 → 失效）
+function parseAiCardCustomId(customId) {
+  const [, authorId, cardId] = customId.split(':');
+  return { authorId, cardId };
 }
 
 // 確認後逐筆建立（依日期升冪）；emoji 前綴規則與既有建立流程一致；筆間 sleep(400)。
@@ -544,8 +560,11 @@ async function presentAiConfirmOrEmpty(placeholder, userId, events, originalText
       `🤖 抽出 ${events.length} 筆事件，但確認卡太長顯示不完整——為了不讓你在沒看到全部內容的情況下按確認，這次先不繼續，麻煩把文字拆成幾段分別丟給我。`
     );
   }
-  aiFlows.set(userId, { phase: 'confirm', events: card.events, expiresAt: Date.now() + 120_000 });
-  return placeholder.edit({ content: card.text, components: [buildAiConfirmRow(userId)] });
+  const now = Date.now();
+  for (const [id, c] of pendingCards) if (now > c.expiresAt) pendingCards.delete(id); // 順手清掉過期卡
+  const cardId = crypto.randomBytes(6).toString('hex');
+  pendingCards.set(cardId, { userId, events: card.events, expiresAt: now + AI_CARD_TTL_MS });
+  return placeholder.edit({ content: card.text, components: [buildAiConfirmRow(userId, cardId)] });
 }
 
 // 依 intent 分派到既有的決定性管線（BOT-AI-INTENT-SPEC.md §管線接軌）：
@@ -569,7 +588,7 @@ async function dispatchByIntent(placeholder, originalMsg, userId, normalized, or
 async function handleAiOutcome(placeholder, originalMsg, userId, normalized, originalText) {
   const { intent, questions } = normalized;
   if (questions.length > 0) {
-    aiFlows.set(userId, { phase: 'clarify', originalText, questions, intent, expiresAt: Date.now() + 120_000 });
+    aiFlows.set(userId, { phase: 'clarify', originalText, questions, intent, expiresAt: Date.now() + AI_REPLY_TTL_MS });
     const qList = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
     return placeholder.edit(
       ['🤖 有幾個地方要跟你確認：', qList, '', '請直接回覆（一則訊息即可）；輸入 `取消` 可放棄本次。'].join('\n')
@@ -599,10 +618,6 @@ async function startAiParse(msg, text) {
 // 有什麼都直接依 intent 分派，不再反問。
 async function handleClarifyAnswer(msg, flow) {
   const userId = msg.author.id;
-  if (Date.now() > flow.expiresAt) {
-    aiFlows.delete(userId);
-    return msg.reply('⌛ 已過期，請重新傳一次原文。');
-  }
   aiFlows.delete(userId);
   const myGen = bumpAiGeneration(userId);
   aiInFlight.add(userId);
@@ -624,10 +639,6 @@ async function handleClarifyAnswer(msg, flow) {
 // 逐筆補缺日期（phase: 'dateFill'，按下確認鈕之後才會進入）：用既有 parseSingleDate 決定性解析。
 async function handleDateFillAnswer(msg, flow) {
   const userId = msg.author.id;
-  if (Date.now() > flow.expiresAt) {
-    aiFlows.delete(userId);
-    return msg.reply('⌛ 已過期，請重新傳一次原文。');
-  }
   const text = msg.content.trim();
   const idx = flow.pendingIndices[flow.cursor];
   const d = parseSingleDate(text, true);
@@ -638,7 +649,7 @@ async function handleDateFillAnswer(msg, flow) {
   flow.cursor += 1;
 
   if (flow.cursor < flow.pendingIndices.length) {
-    flow.expiresAt = Date.now() + 120_000;
+    flow.expiresAt = Date.now() + AI_REPLY_TTL_MS;
     const nextIdx = flow.pendingIndices[flow.cursor];
     return msg.reply(`📅 「${flow.events[nextIdx].name}」是哪天？（可用 7/30、2026-07-30、今天、明天）`);
   }
@@ -649,50 +660,60 @@ async function handleDateFillAnswer(msg, flow) {
   return msg.reply(buildAiCreateReport(results));
 }
 
-// 三種等待中的 AI 流程狀態的訊息分派（confirm 階段是按鈕驅動，文字訊息只提醒去按鈕）。
+// 等待中的 AI 流程狀態的訊息分派（確認卡是按鈕驅動，不在 aiFlows 裡）。
 function handleAiFlowMessage(msg, flow) {
   if (flow.phase === 'clarify') return handleClarifyAnswer(msg, flow);
   if (flow.phase === 'dateFill') return handleDateFillAnswer(msg, flow);
-  if (flow.phase === 'confirm') {
-    return msg.reply('請按上面的「✅ 全部建立」或「❌ 取消」按鈕，或輸入 `取消` 放棄。');
-  }
+  aiFlows.delete(msg.author.id);
   return msg.reply('狀態異常，已重置，請重新傳文字給我。'); // 防禦性，理論上不會走到
 }
 
+const AI_CARD_GONE_TEXT = '這張確認卡已失效（超過 24 小時、已取消，或 bot 重啟過），請重新傳一次原文。';
+
 // 按下確認卡「✅ 全部建立」：若有缺日期的事件先逐筆問，問完才真正建立。
 async function handleAiConfirmOk(interaction) {
-  const authorId = interaction.customId.slice('plane_ai_ok:'.length);
+  const { authorId, cardId } = parseAiCardCustomId(interaction.customId);
   if (interaction.user.id !== authorId) {
     return interaction.reply({ content: '這張確認卡不是給你的。', ephemeral: true });
   }
-  const flow = aiFlows.get(authorId);
-  if (!flow || flow.phase !== 'confirm' || Date.now() > flow.expiresAt) {
-    aiFlows.delete(authorId);
-    return interaction.update({ content: '已過期，請重新傳一次原文。', components: [] });
+  const card = pendingCards.get(cardId);
+  if (!card || card.userId !== authorId || Date.now() > card.expiresAt) {
+    if (card && Date.now() > card.expiresAt) pendingCards.delete(cardId);
+    return interaction.update({ content: AI_CARD_GONE_TEXT, components: [] });
   }
 
-  const missingIdx = flow.events.map((e, i) => (e.due ? -1 : i)).filter((i) => i !== -1);
+  const missingIdx = card.events.map((e, i) => (e.due ? -1 : i)).filter((i) => i !== -1);
+  // 要進補日期時，不能蓋掉別張卡的補日期／澄清，也不能撞上還在跑的 AI 解析（它跑完會清掉或覆蓋 aiFlows）；
+  // 這時卡片保留，請使用者等一下再按。
+  const activeFlow = aiFlows.get(authorId);
+  const busy = (activeFlow && Date.now() <= activeFlow.expiresAt) || aiInFlight.has(authorId) || sessions.has(authorId);
+  if (missingIdx.length > 0 && busy) {
+    return interaction.reply({
+      content: '你還有一段對話在進行中（解析中，或等你回答日期／澄清問題）。先把它回答完，再回來按這張卡（卡片仍有效；打 `取消` 會連這張卡一起作廢）。',
+      ephemeral: true,
+    });
+  }
+  pendingCards.delete(cardId); // 同步消耗（與上面的檢查之間沒有 await），連按兩下也只會建一次
   if (missingIdx.length > 0) {
-    aiFlows.set(authorId, { phase: 'dateFill', events: flow.events, pendingIndices: missingIdx, cursor: 0, expiresAt: Date.now() + 120_000 });
+    aiFlows.set(authorId, { phase: 'dateFill', events: card.events, pendingIndices: missingIdx, cursor: 0, expiresAt: Date.now() + AI_REPLY_TTL_MS });
     const firstIdx = missingIdx[0];
     return interaction.update({
-      content: `✅ 收到，還有 ${missingIdx.length} 筆缺日期。\n📅 「${flow.events[firstIdx].name}」是哪天？（可用 7/30、2026-07-30、今天、明天）`,
+      content: `✅ 收到，還有 ${missingIdx.length} 筆缺日期。\n📅 「${card.events[firstIdx].name}」是哪天？（可用 7/30、2026-07-30、今天、明天）`,
       components: [],
     });
   }
 
-  aiFlows.delete(authorId);
-  await interaction.update({ content: `⏳ 建立 ${flow.events.length} 筆中…`, components: [] });
-  const results = await createAiEvents(flow.events);
+  await interaction.update({ content: `⏳ 建立 ${card.events.length} 筆中…`, components: [] });
+  const results = await createAiEvents(card.events);
   return interaction.editReply(buildAiCreateReport(results));
 }
 
 async function handleAiConfirmNo(interaction) {
-  const authorId = interaction.customId.slice('plane_ai_no:'.length);
+  const { authorId, cardId } = parseAiCardCustomId(interaction.customId);
   if (interaction.user.id !== authorId) {
     return interaction.reply({ content: '這張確認卡不是給你的。', ephemeral: true });
   }
-  aiFlows.delete(authorId);
+  pendingCards.delete(cardId);
   return interaction.update({ content: '已取消，這批不會建立。', components: [] });
 }
 
@@ -991,9 +1012,11 @@ client.on('messageCreate', async (msg) => {
       return; // 防禦性，理論上不會走到（session.step 只會是上述三值之一）
     }
 
-    // AI 流程等待使用者輸入的三種狀態（clarify/confirm/dateFill）優先於「查」「刪」與新一輪解析。
+    // AI 流程等待使用者輸入的狀態（clarify/dateFill）優先於「查」「刪」與新一輪解析；
+    // 已過期的不吃這則訊息，清掉後照新的輸入往下走。
     const flow = aiFlows.get(msg.author.id);
-    if (flow) return handleAiFlowMessage(msg, flow);
+    if (flow && Date.now() > flow.expiresAt) aiFlows.delete(msg.author.id);
+    else if (flow) return handleAiFlowMessage(msg, flow);
 
     // 已有一輪 AI 呼叫在跑，還沒回來——不要再開一輪，避免重複呼叫 claude -p。
     if (aiInFlight.has(msg.author.id)) {
@@ -1011,7 +1034,7 @@ client.on('messageCreate', async (msg) => {
     return startAiParse(msg, text);
   } catch (err) {
     console.error('[bot] messageCreate error:', err);
-    clearAiState(msg.author.id);
+    clearAiState(msg.author.id, { keepCards: true });
     try {
       await msg.reply(`❌ 建立失敗：${err.message}\n請重新傳一次再試。`);
     } catch (_) {}
@@ -1133,7 +1156,11 @@ module.exports = {
   startStepwiseSession,
   aiFallbackContent,
   clearAiState,
-  aiFlows, // 測試用：可直接操作 expiresAt 驗證 120 秒過期邏輯，不用真的等
+  aiFlows, // 測試用：可直接操作 expiresAt 驗證澄清／補日期的過期邏輯，不用真的等
+  pendingCards, // 測試用：可直接操作 expiresAt 驗證確認卡 24 小時過期
+  presentAiConfirmOrEmpty,
+  handleAiConfirmOk,
+  handleAiConfirmNo,
   aiInFlight,
   aiGeneration,
   // ↓ AI 意圖分類（BOT-AI-INTENT-SPEC.md）新增匯出，供測試/驗收使用

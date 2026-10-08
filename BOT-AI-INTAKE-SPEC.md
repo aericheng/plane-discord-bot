@@ -48,7 +48,7 @@ bot 端的決定性驗證（不信任 AI 輸出）：
    2. 💯 物理第六週測驗 — 2026-08-07
    [✅ 全部建立] [❌ 取消]
    ```
-   customId `plane_ai_ok` / `plane_ai_no`；待確認狀態 userId → {events, expiresAt}，**120 秒過期**；按鈕 userId 必須等於發文者。
+   customId `plane_ai_ok:<userId>:<cardId>` / `plane_ai_no:<userId>:<cardId>`；待確認狀態 cardId → {userId, events, expiresAt}，**24 小時過期**（2026-10-08 自 120 秒放寬：使用者常超過 2 分鐘才按）；卡片之間互相獨立、不擋後續訊息，按過即消耗；按鈕 userId 必須等於發文者。澄清／補日期這類「下一則訊息當回答」的狀態 10 分鐘過期，過期後下一則訊息當新輸入處理。
 5. 確認後逐筆 `createPlaneIssue`（筆間 `sleep(400)`），emoji 前綴規則與既有建立流程一致；回報每筆的名稱/日期/id，全部來自 POST 回應。
 6. 部分失敗要逐筆誠實回報（成功幾筆、失敗幾筆＋HTTP 碼）。
 
