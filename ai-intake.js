@@ -7,6 +7,7 @@
 // 2. prompt 一律走 stdin，argv 只放旗標；空字串/含 ()&|<>^% 的旗標值要補引號。
 // 3. timeout 要先 taskkill /T 殺整棵樹（趁根行程還活著才走訪得到孫行程），10 秒保險絲防孤兒行程卡死 close。
 
+const fs = require('node:fs');
 const { spawn, execSync } = require('node:child_process');
 
 // 存活中的 claude 子行程 PID，供 bot.js 在關機時收割，避免殭屍行程（learning bot 2026-07-09 實案教訓）。
@@ -28,7 +29,7 @@ function killActiveClaudeChildren() {
 }
 
 // spawn(..., {shell:true}) 在 Windows 上只是把 command 與每個 arg 用空白 join 丟給 cmd.exe，
-// 不會幫每個 arg 自動加引號。--allowedTools 這裡固定傳空字串（不給任何工具權限），空字串會被
+// 不會幫每個 arg 自動加引號。PURE_TEXT_FLAGS 的 --tools 固定傳空字串（不給任何工具），空字串會被
 // cmd.exe 吞掉造成「argument missing」，所以空字串或含 cmd 特殊字元的值要補雙引號。
 function shellQuoteArg(value) {
   const str = String(value);
@@ -62,7 +63,7 @@ function classifyFailure({ exitCode, resultText, stderr }) {
   const primary = (resultText ?? '').trim() || (stderr ?? '').trim();
   const errorExcerpt = primary.slice(0, 300);
   const combined = `${resultText ?? ''}\n${stderr ?? ''}`;
-  const errorCode = USAGE_LIMIT_REGEX.test(combined) ? 'usage_limit' : `exit_code_${exitCode}`;
+  const errorCode = USAGE_LIMIT_REGEX.test(combined) ? 'usage_limit' : exitCode === 'is_error' ? 'is_error' : `exit_code_${exitCode}`;
   const error = errorExcerpt ? `${errorCode}: ${errorExcerpt}` : errorCode;
   return { errorCode, error };
 }
@@ -72,23 +73,68 @@ function classifyFailure({ exitCode, resultText, stderr }) {
 // 被拒絕、不會扣款）。API 回額度／帳務／金鑰／速率類錯誤就改用訂閱重跑，並暫停 API 一小時（bot 是常駐，
 // 用時間冷卻而非整個 process 停用）。沒設 key 時行為不變。
 // 刻意不用 ANTHROPIC_API_KEY 這個標準名稱：dotenv 載入後會被這個 process 的所有子程序繼承。
-// --output-format text 沒有 api_error_status 欄位，只能比對錯誤文字（實測無效 key 輸出「Invalid API key」）。
+// 2026-10-11 起改用 --output-format json（為了取 total_cost_usd 記帳）：優先看 envelope 的 api_error_status，
+// 拿不到（例如 CLI 沒輸出 envelope）才比對錯誤文字（實測無效 key 輸出「Invalid API key」）。
 const API_FALLBACK_COOLDOWN_MS = 60 * 60 * 1000;
+// envelope 的 api_error_status：401/403 金鑰、402 帳務、429 速率或 spend limit（2026-10-10 實測無效 key → 401）
+const API_FALLBACK_STATUSES = new Set([401, 402, 403, 429]);
 const API_BILLING_ERROR_RE = /credit balance|billing|insufficient|spend[ _-]?limit|invalid[ _-]?(x-)?api[ _-]?key|authentication|unauthorized|permission_error|rate[ _-]?limit|\b40[123]\b|\b429\b/i;
 let apiDisabledUntil = 0;
+
+// 精簡模式（同 e3-course-watch 的 PURE_TEXT_FLAGS）：不載入使用者層設定／MCP／工具／slash commands，
+// 搭配 CLAUDE_CODE_DISABLE_CLAUDE_MDS=1，前綴從完整 Claude Code（~45K token）降到只剩解析 prompt。
+// spawn 用 shell:true，每個參數都要經 shellQuoteArg；system prompt 不可含雙引號。
+const PURE_TEXT_FLAGS = [
+  '--setting-sources', 'project',
+  '--strict-mcp-config',
+  '--tools', '',
+  '--disable-slash-commands',
+  '--no-session-persistence',
+  '--system-prompt', 'You are a concise assistant. Follow the user instructions exactly and reply only in the requested format.',
+];
 
 function getAutomationApiKey() {
   return (process.env.AUTOMATION_ANTHROPIC_API_KEY || '').trim();
 }
 
+// API 花費帳本（claude status 的 Discord 儀表板按額度週期加總顯示）；寫入失敗不影響主流程
+const API_LEDGER_PATH = process.env.AUTOMATION_API_LEDGER || 'C:/Users/user/Desktop/dev/claude status/api-ledger.jsonl';
+function appendApiLedger(entry) {
+  try {
+    fs.appendFileSync(API_LEDGER_PATH, `${JSON.stringify({ ts: new Date().toISOString(), project: 'plane-discord-bot', label: 'parse', ...entry })}\n`);
+  } catch {
+    // 帳本只是儀表板估算用，寫不進去就算了
+  }
+}
+
+/** --output-format json 的 stdout 是單一 envelope；解析失敗（或非 envelope）就把整段 stdout 當回覆文字。 */
+function parseEnvelope(stdout) {
+  try {
+    const envelope = JSON.parse(stdout);
+    if (envelope && typeof envelope.result === 'string') {
+      return {
+        result: envelope.result,
+        usage: envelope.usage || null,
+        isError: envelope.is_error === true,
+        apiErrorStatus: typeof envelope.api_error_status === 'number' ? envelope.api_error_status : null,
+        costUsd: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : null,
+      };
+    }
+  } catch {
+    // 不是合法 JSON envelope，當純文字處理
+  }
+  return { result: stdout, usage: null, isError: false, apiErrorStatus: null, costUsd: null };
+}
+
 /** API 路徑的失敗是否該改走訂閱（額度用完、帳務、金鑰無效、API 速率限制）；逾時等其他錯誤不算。 */
 function isApiBillingError(result) {
   if (!result || result.ok || result.errorCode === 'timeout' || result.errorCode === 'spawn_error') return false;
+  if (API_FALLBACK_STATUSES.has(result.apiErrorStatus)) return true;
   return API_BILLING_ERROR_RE.test(`${result.error || ''}\n${result.resultText || ''}`);
 }
 
 /**
- * 執行 `claude -p` 呼叫（純文字輸出，不給工具權限）。
+ * 執行 `claude -p` 呼叫（JSON envelope 輸出、回傳其中的回覆文字；不給工具權限）。
  * 有 API key 且不在冷卻期 → 先走 API；API 額度／帳務類失敗 → 改走訂閱重跑一次。
  * @param {object} opts
  * @param {string} opts.prompt - 送進 stdin 的 prompt 全文
@@ -117,11 +163,11 @@ function runClaudeOnce({ prompt, model, timeoutMs, cwd }, billing) {
     const startedAt = Date.now();
     const args = [
       '-p',
-      '--output-format', 'text',
+      '--output-format', 'json',
       '--model', resolvedModel,
-      '--allowedTools', shellQuoteArg(''),
+      ...PURE_TEXT_FLAGS.map(shellQuoteArg),
     ];
-    const env = { ...process.env };
+    const env = { ...process.env, CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1' };
     delete env.AUTOMATION_ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
@@ -211,12 +257,18 @@ function runClaudeOnce({ prompt, model, timeoutMs, cwd }, billing) {
         resolve({ ok: false, resultText: '', raw: { stdout, stderr }, durationMs, error: 'timeout', errorCode: 'timeout' });
         return;
       }
-      if (code === 0) {
-        resolve({ ok: true, resultText: stdout, raw: { stdout, stderr }, durationMs, error: null, errorCode: null });
+      // --output-format json：取 envelope.result 當回覆文字；解析失敗就退回整段 stdout（與 text 模式相同）
+      const env = parseEnvelope(stdout);
+      if (billing === 'api' && env.costUsd != null) {
+        appendApiLedger({ model: resolvedModel, ok: code === 0 && !env.isError, cost_usd: env.costUsd, input: env.usage?.input_tokens ?? 0, output: env.usage?.output_tokens ?? 0 });
+      }
+      if (code === 0 && !env.isError) {
+        resolve({ ok: true, resultText: env.result, raw: { stdout, stderr }, durationMs, error: null, errorCode: null, apiErrorStatus: null });
         return;
       }
-      const failure = classifyFailure({ exitCode: code, resultText: stdout, stderr });
-      resolve({ ok: false, resultText: stdout, raw: { stdout, stderr }, durationMs, error: failure.error, errorCode: failure.errorCode });
+      // exit 0 但 envelope 標 is_error 時，錯誤碼標成 is_error 而非容易誤會的 exit_code_0
+      const failure = classifyFailure({ exitCode: code === 0 ? 'is_error' : code, resultText: env.result, stderr });
+      resolve({ ok: false, resultText: env.result, raw: { stdout, stderr }, durationMs, error: failure.error, errorCode: failure.errorCode, apiErrorStatus: env.apiErrorStatus });
     });
 
     child.stdin.write(prompt);
