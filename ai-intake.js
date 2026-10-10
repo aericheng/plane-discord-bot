@@ -67,20 +67,53 @@ function classifyFailure({ exitCode, resultText, stderr }) {
   return { errorCode, error };
 }
 
+// 計費路徑（2026-10-10，與 e3-course-watch／gmail-watch 同款）：.env 有 AUTOMATION_ANTHROPIC_API_KEY 時
+// 優先走 API（吃 Max 方案每月附的 API credits；綁定的 Console org 不加卡、不開 auto-reload，額度用完只會
+// 被拒絕、不會扣款）。API 回額度／帳務／金鑰／速率類錯誤就改用訂閱重跑，並暫停 API 一小時（bot 是常駐，
+// 用時間冷卻而非整個 process 停用）。沒設 key 時行為不變。
+// 刻意不用 ANTHROPIC_API_KEY 這個標準名稱：dotenv 載入後會被這個 process 的所有子程序繼承。
+// --output-format text 沒有 api_error_status 欄位，只能比對錯誤文字（實測無效 key 輸出「Invalid API key」）。
+const API_FALLBACK_COOLDOWN_MS = 60 * 60 * 1000;
+const API_BILLING_ERROR_RE = /credit balance|billing|insufficient|spend[ _-]?limit|invalid[ _-]?(x-)?api[ _-]?key|authentication|unauthorized|permission_error|rate[ _-]?limit|\b40[123]\b|\b429\b/i;
+let apiDisabledUntil = 0;
+
+function getAutomationApiKey() {
+  return (process.env.AUTOMATION_ANTHROPIC_API_KEY || '').trim();
+}
+
+/** API 路徑的失敗是否該改走訂閱（額度用完、帳務、金鑰無效、API 速率限制）；逾時等其他錯誤不算。 */
+function isApiBillingError(result) {
+  if (!result || result.ok || result.errorCode === 'timeout' || result.errorCode === 'spawn_error') return false;
+  return API_BILLING_ERROR_RE.test(`${result.error || ''}\n${result.resultText || ''}`);
+}
+
 /**
- * 執行一次 `claude -p` 呼叫（純文字輸出，不給工具權限）。
+ * 執行 `claude -p` 呼叫（純文字輸出，不給工具權限）。
+ * 有 API key 且不在冷卻期 → 先走 API；API 額度／帳務類失敗 → 改走訂閱重跑一次。
  * @param {object} opts
  * @param {string} opts.prompt - 送進 stdin 的 prompt 全文
  * @param {string} [opts.model]
  * @param {number} [opts.timeoutMs]
  * @param {string} [opts.cwd]
- * @returns {Promise<{ok:boolean, resultText:string, raw:{stdout:string,stderr:string}, durationMs:number, error:string|null, errorCode:string|null}>}
+ * @returns {Promise<{ok:boolean, resultText:string, raw:{stdout:string,stderr:string}, durationMs:number, error:string|null, errorCode:string|null, billing:string}>}
  */
-function runClaude({ prompt, model, timeoutMs, cwd }) {
+async function runClaude(opts) {
+  if (getAutomationApiKey() && Date.now() >= apiDisabledUntil) {
+    const viaApi = await runClaudeOnce(opts, 'api');
+    if (!isApiBillingError(viaApi)) return viaApi;
+    apiDisabledUntil = Date.now() + API_FALLBACK_COOLDOWN_MS;
+    console.log(`[ai-intake] billing fallback: API 失敗（${String(viaApi.resultText || viaApi.error).trim().slice(0, 160)}），改走訂閱，API 暫停 ${API_FALLBACK_COOLDOWN_MS / 60000} 分鐘`);
+  }
+  return runClaudeOnce(opts, 'subscription');
+}
+
+/** 執行一次 `claude -p`；billing='api' 帶 API key，'subscription' 清掉所有 API 憑證、只用 CLI 的訂閱登入。 */
+function runClaudeOnce({ prompt, model, timeoutMs, cwd }, billing) {
   const resolvedModel = model || getParserModel();
   const resolvedTimeout = timeoutMs || getParserTimeoutMs();
 
-  return new Promise((resolve) => {
+  return new Promise((resolveRaw) => {
+    const resolve = (r) => resolveRaw({ ...r, billing });
     const startedAt = Date.now();
     const args = [
       '-p',
@@ -88,10 +121,15 @@ function runClaude({ prompt, model, timeoutMs, cwd }) {
       '--model', resolvedModel,
       '--allowedTools', shellQuoteArg(''),
     ];
+    const env = { ...process.env };
+    delete env.AUTOMATION_ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    if (billing === 'api') env.ANTHROPIC_API_KEY = getAutomationApiKey();
 
     let child;
     try {
-      child = spawn(getCliPath(), args, { cwd: cwd || process.cwd(), shell: true });
+      child = spawn(getCliPath(), args, { cwd: cwd || process.cwd(), shell: true, env });
       if (child.pid) activePids.add(child.pid);
     } catch (err) {
       resolve({
