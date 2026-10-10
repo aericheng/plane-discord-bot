@@ -43,7 +43,9 @@ function shellQuoteArg(value) {
 // 預設值來自本機 `where claude` 的實測結果，.env 的 CLAUDE_CLI_PATH 可覆寫；用 getter 讀取，
 // 讓 process.env 的變動（測試時）能立刻反映，不用重啟 process。
 const DEFAULT_CLAUDE_CLI_PATH = 'C:\\Users\\user\\.local\\bin\\claude.exe';
-const DEFAULT_PARSER_MODEL = 'claude-haiku-4-5-20251001';
+// 2026-10-11 從 claude-haiku-4-5-20251001 換成 Haiku 5.5：20 則代表性訊息兩者都 20/20，
+// 官方價每則約 $0.0007 對 $0.0087、平均 6.1 秒對 13.6 秒。
+const DEFAULT_PARSER_MODEL = 'claude-haiku-5-5';
 const DEFAULT_PARSER_TIMEOUT_MS = 90 * 1000;
 
 function getCliPath() {
@@ -75,7 +77,6 @@ function classifyFailure({ exitCode, resultText, stderr }) {
 // 刻意不用 ANTHROPIC_API_KEY 這個標準名稱：dotenv 載入後會被這個 process 的所有子程序繼承。
 // 2026-10-11 起改用 --output-format json（為了取 total_cost_usd 記帳）：優先看 envelope 的 api_error_status，
 // 拿不到（例如 CLI 沒輸出 envelope）才比對錯誤文字（實測無效 key 輸出「Invalid API key」）。
-const API_FALLBACK_COOLDOWN_MS = 60 * 60 * 1000;
 // envelope 的 api_error_status：401/403 金鑰、402 帳務、429 速率或 spend limit（2026-10-10 實測無效 key → 401）
 const API_FALLBACK_STATUSES = new Set([401, 402, 403, 429]);
 const API_BILLING_ERROR_RE = /credit balance|billing|insufficient|spend[ _-]?limit|invalid[ _-]?(x-)?api[ _-]?key|authentication|unauthorized|permission_error|rate[ _-]?limit|\b40[123]\b|\b429\b/i;
@@ -118,12 +119,36 @@ function parseEnvelope(stdout) {
         isError: envelope.is_error === true,
         apiErrorStatus: typeof envelope.api_error_status === 'number' ? envelope.api_error_status : null,
         costUsd: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : null,
+        costBasis: Object.values(envelope.modelUsage || {}).map((m) => m && m.costBasis).filter(Boolean),
       };
     }
   } catch {
     // 不是合法 JSON envelope，當純文字處理
   }
-  return { result: stdout, usage: null, isError: false, apiErrorStatus: null, costUsd: null };
+  return { result: stdout, usage: null, isError: false, apiErrorStatus: null, costUsd: null, costBasis: [] };
+}
+
+// CLI 不認得的新 model 會回 modelUsage.costBasis = 'unknown' 並套錯單價（2026-10-11 實測 Haiku 5.5 被高估約 40 倍），
+// 這時改用 usage × 官方單價自己算。單位：USD / 百萬 token；cache write 5 分鐘 1.25x、1 小時 2x，cache read 0.1x。
+// 價格來源：claude-api skill shared/models.md（Haiku 5.5：prompt ≤100K 時 $0.10 / $0.50）。
+const OFFICIAL_PRICES = {
+  'claude-haiku-5-5': { input: 0.10, output: 0.50 },
+};
+function estimateCostUsd(model, usage) {
+  const price = OFFICIAL_PRICES[model];
+  if (!price || !usage) return null;
+  const cc = usage.cache_creation_input_tokens ?? 0;
+  const cc1h = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+  const cc5m = usage.cache_creation?.ephemeral_5m_input_tokens ?? (cc - cc1h);
+  const inputUnits = (usage.input_tokens ?? 0) + cc5m * 1.25 + cc1h * 2 + (usage.cache_read_input_tokens ?? 0) * 0.1;
+  return (inputUnits * price.input + (usage.output_tokens ?? 0) * price.output) / 1e6;
+}
+function ledgerCost(model, env) {
+  if (env.costBasis.includes('unknown')) {
+    const est = estimateCostUsd(model, env.usage);
+    if (est != null) return { cost: est, source: 'official_price' };
+  }
+  return { cost: env.costUsd, source: 'cli' };
 }
 
 /** API 路徑的失敗是否該改走訂閱（額度用完、帳務、金鑰無效、API 速率限制）；逾時等其他錯誤不算。 */
@@ -131,6 +156,73 @@ function isApiBillingError(result) {
   if (!result || result.ok || result.errorCode === 'timeout' || result.errorCode === 'spawn_error') return false;
   if (API_FALLBACK_STATUSES.has(result.apiErrorStatus)) return true;
   return API_BILLING_ERROR_RE.test(`${result.error || ''}\n${result.resultText || ''}`);
+}
+
+
+// 共用 API 冷卻檔（2026-10-11）：e3／gmail／plane／lab-slack 共用同一把 key 與同一個 credit 池，
+// 排程型專案每次都是新 process、記憶體冷卻會歸零，所以冷卻狀態落檔共用（api-cooldown.json）。
+// 內嵌實作，邏輯與常數需與其他專案一致。讀失敗＝沒冷卻；寫失敗只 log，絕不影響主流程。
+const API_COOLDOWN_PROJECT = 'plane-discord-bot';
+const API_CREDIT_CYCLE_DAY = 10;
+const API_CREDIT_RE = /credit balance|insufficient|billing|spend[ _-]?limit/i;
+const API_AUTH_RE = /invalid[ _-]?(x-)?api[ _-]?key|authentication|unauthorized|permission_error/i;
+
+function apiCooldownPath() {
+  return process.env.AUTOMATION_API_COOLDOWN || 'C:/Users/user/Desktop/dev/claude status/api-cooldown.json';
+}
+
+/** 下一個額度週期起點（每月 10 號 00:00 UTC）；剛過起點 3 天內（10–12 號）額度可能還沒發 → now + 6 小時。 */
+function nextCreditUntil(now = Date.now()) {
+  const d = new Date(now);
+  const day = d.getUTCDate();
+  if (day < API_CREDIT_CYCLE_DAY) return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), API_CREDIT_CYCLE_DAY);
+  if (day < API_CREDIT_CYCLE_DAY + 3) return now + 6 * 60 * 60 * 1000;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, API_CREDIT_CYCLE_DAY);
+}
+
+/** API 失敗分類 → { reason: 'credit'|'auth'|'rate', until: 毫秒時間戳 }；status 優先，沒有才看文字，都不中 → rate。 */
+function classifyApiFailure(result, now = Date.now()) {
+  const status = typeof result?.apiErrorStatus === 'number' ? result.apiErrorStatus : null;
+  const text = `${result?.error || ''}\n${result?.resultText || ''}`;
+  let reason;
+  if (status === 402) reason = 'credit';
+  else if (status === 401 || status === 403) reason = 'auth';
+  else if (status === 429) reason = 'rate';
+  else if (API_CREDIT_RE.test(text)) reason = 'credit';
+  else if (API_AUTH_RE.test(text)) reason = 'auth';
+  else reason = 'rate';
+  const until = reason === 'credit' ? nextCreditUntil(now) : reason === 'auth' ? now + 24 * 60 * 60 * 1000 : now + 60 * 60 * 1000;
+  return { reason, until };
+}
+
+/** 讀冷卻檔；不存在／壞掉／until 解析失敗 → { until: 0, reason: null }。 */
+function readApiCooldown() {
+  try {
+    const j = JSON.parse(fs.readFileSync(apiCooldownPath(), 'utf8'));
+    const until = Date.parse(j?.until);
+    if (Number.isFinite(until)) return { until, reason: j.reason ?? null };
+  } catch {
+    /* 沒有冷卻檔或壞檔 → 視為沒有冷卻 */
+  }
+  return { until: 0, reason: null };
+}
+
+/** API 失敗時寫冷卻檔（已有較晚的 until 不覆蓋）；回傳實際生效的 until（毫秒）。寫檔失敗只 log。 */
+function writeApiCooldown(result, now = Date.now()) {
+  const { reason, until } = classifyApiFailure(result, now);
+  const prev = readApiCooldown();
+  if (prev.until >= until) return prev.until;
+  const file = apiCooldownPath();
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    const status = typeof result?.apiErrorStatus === 'number' ? result.apiErrorStatus : null;
+    fs.writeFileSync(tmp, JSON.stringify({ until: new Date(until).toISOString(), reason, status, project: API_COOLDOWN_PROJECT, set_at: new Date(now).toISOString() }));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    console.log(`[ai-intake] ${`API 冷卻檔寫入失敗（不影響主流程）：${err.message}`}`);
+    try { fs.unlinkSync(tmp); } catch { /* 暫存檔可能不存在 */ }
+  }
+  return until;
 }
 
 /**
@@ -144,11 +236,17 @@ function isApiBillingError(result) {
  * @returns {Promise<{ok:boolean, resultText:string, raw:{stdout:string,stderr:string}, durationMs:number, error:string|null, errorCode:string|null, billing:string}>}
  */
 async function runClaude(opts) {
-  if (getAutomationApiKey() && Date.now() >= apiDisabledUntil) {
-    const viaApi = await runClaudeOnce(opts, 'api');
-    if (!isApiBillingError(viaApi)) return viaApi;
-    apiDisabledUntil = Date.now() + API_FALLBACK_COOLDOWN_MS;
-    console.log(`[ai-intake] billing fallback: API 失敗（${String(viaApi.resultText || viaApi.error).trim().slice(0, 160)}），改走訂閱，API 暫停 ${API_FALLBACK_COOLDOWN_MS / 60000} 分鐘`);
+  if (getAutomationApiKey()) {
+    const cd = readApiCooldown();
+    const until = Math.max(apiDisabledUntil, cd.until);
+    if (Date.now() < until) {
+      console.log(`[ai-intake] API 冷卻中: reason=${cd.reason ?? 'memory'} until=${new Date(until).toISOString()}，直接走訂閱`);
+    } else {
+      const viaApi = await runClaudeOnce(opts, 'api');
+      if (!isApiBillingError(viaApi)) return viaApi;
+      apiDisabledUntil = writeApiCooldown(viaApi);
+      console.log(`[ai-intake] billing fallback: API 失敗（status=${viaApi.apiErrorStatus ?? '-'} ${String(viaApi.resultText || viaApi.error).trim().slice(0, 160)}），改走訂閱，API 暫停至 ${new Date(apiDisabledUntil).toISOString()}`);
+    }
   }
   return runClaudeOnce(opts, 'subscription');
 }
@@ -260,7 +358,8 @@ function runClaudeOnce({ prompt, model, timeoutMs, cwd }, billing) {
       // --output-format json：取 envelope.result 當回覆文字；解析失敗就退回整段 stdout（與 text 模式相同）
       const env = parseEnvelope(stdout);
       if (billing === 'api' && env.costUsd != null) {
-        appendApiLedger({ model: resolvedModel, ok: code === 0 && !env.isError, cost_usd: env.costUsd, input: env.usage?.input_tokens ?? 0, output: env.usage?.output_tokens ?? 0 });
+        const { cost, source } = ledgerCost(resolvedModel, env);
+        appendApiLedger({ model: resolvedModel, ok: code === 0 && !env.isError, cost_usd: cost, cost_source: source, input: env.usage?.input_tokens ?? 0, output: env.usage?.output_tokens ?? 0 });
       }
       if (code === 0 && !env.isError) {
         resolve({ ok: true, resultText: env.result, raw: { stdout, stderr }, durationMs, error: null, errorCode: null, apiErrorStatus: null });
@@ -517,6 +616,14 @@ async function runAiParse({ userText, clarify }) {
 module.exports = {
   runAiParse,
   runClaude,
+  estimateCostUsd,
+  ledgerCost,
+  parseEnvelope,
+  classifyApiFailure,
+  nextCreditUntil,
+  readApiCooldown,
+  writeApiCooldown,
+  isApiBillingError,
   extractJson,
   buildParsePrompt,
   normalizeAiResult,

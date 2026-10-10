@@ -13,7 +13,7 @@
 
 - 參考實作：`C:\Users\user\Desktop\dev\claude code learning bot\src\claude-runner.js`——**必讀**，它已解掉三個 Windows 地雷：(a) prompt 一律走 stdin 不進 argv；(b) 空字串/含 `()&|<>^%` 的參數要補引號（shellQuoteArg）；(c) timeout 要殺整棵程序樹。
 - **claude CLI 的絕對路徑**：排程任務的 PATH 不完整（已知地雷），bot 不能假設 `claude` 在 PATH 上。實作時用 `where claude` 查出絕對路徑寫進常數，並支援 `.env` 的 `CLAUDE_CLI_PATH` 覆寫。
-- model：預設 `claude-haiku-4-5-20251001`（速度優先），`.env` 的 `PARSER_MODEL` 可覆寫。
+- model：預設 `claude-haiku-5-5`（2026-10-11 由 Haiku 4.5 換過來；速度優先），`.env` 的 `PARSER_MODEL` 可覆寫。
 - timeout 預設 90 秒（`.env` `PARSER_TIMEOUT_MS` 可覆寫），逾時/失敗走 fallback（見下）。
 - 呼叫旗標參考：`claude -p --model <m> --output-format text`，不給任何工具權限（`--allowedTools ""` 的空字串地雷見 claude-runner）。
 
