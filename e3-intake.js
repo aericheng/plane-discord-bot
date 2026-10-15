@@ -216,10 +216,31 @@ function buildEditModal(parsed) {
 }
 
 // ===== 互動處理 =====
+// 同一張卡處理中（message id）的第二次互動直接擋掉。2026-10-15 實測：按 ✅ 後要先抓完 Plane 全部列表（數秒）
+// 才建立，期間按鈕還在，連點兩下 → 兩次去重都看不到對方 → 建出兩筆同名事件。
+const inFlight = new Set();
+
+async function handleE3Interaction(interaction, deps) {
+  // ✏️ 只開 modal、不動資料，不上鎖（showModal 必須是第一個回應）
+  if (interaction.isButton() && interaction.customId === E3_BUTTON_EDIT) return handleE3InteractionInner(interaction, deps);
+  const key = interaction.message && interaction.message.id;
+  if (key && inFlight.has(key)) {
+    (deps.log || console.log)(`[bot] e3 duplicate interaction ignored (message ${key})`);
+    await interaction.deferUpdate();
+    return interaction.followUp({ content: '⏳ 這張卡正在處理中，請勿重複按。', ephemeral: true });
+  }
+  if (key) inFlight.add(key);
+  try {
+    return await handleE3InteractionInner(interaction, deps);
+  } finally {
+    if (key) inFlight.delete(key);
+  }
+}
+
 // 前置：呼叫端（bot.js）已做 ALLOWED_USER_ID 檢查；本模組不做頻道閘門（卡片在 #e3-bot，不在 #plane）。
 // 按鈕先 deferUpdate；✏️ 例外——showModal 必須是第一個回應。modal submit 用 isFromMessage 確認後 deferUpdate，
 // 原卡片用 interaction.message。成功／略過 → 改卡片並拿掉按鈕；同名多筆或 API 失敗 → 按鈕保留、followUp ephemeral。
-async function handleE3Interaction(interaction, deps) {
+async function handleE3InteractionInner(interaction, deps) {
   const { LABELS, log = console.log } = deps;
 
   if (interaction.isButton()) {

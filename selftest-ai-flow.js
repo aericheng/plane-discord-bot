@@ -1,5 +1,6 @@
 // 確認卡／澄清／補日期的過期行為自測（純 node、不連網、不呼叫 claude -p、不碰 Plane API）
 const bot = require('./bot');
+const { handleDeleteConfirm, pendingDeletes } = bot;
 const { client, aiFlows, pendingCards, aiInFlight, presentAiConfirmOrEmpty, handleAiConfirmOk, handleAiConfirmNo, clearAiState } = bot;
 
 let n = 0;
@@ -154,6 +155,33 @@ async function run() {
   clearAiState(USER, { keepCards: true });
   ok(pendingCards.has(okD.split(':')[2]), 'keepCards：錯誤重置不清卡');
   clearAiState(USER);
+
+  // 13. 連點兩下只寫一次（回歸：2026-10-15 E3 重複建立事故；這兩條路徑靠「await 之前同步清 pending」天然冪等）
+  //     stub 全域 fetch 計數 Plane 寫入；interaction.update 刻意變慢，讓兩次點擊在同一個 event loop 窗口交疊。
+  const realFetch = global.fetch;
+  const writes = { POST: 0, DELETE: 0 };
+  global.fetch = async (url, opts = {}) => {
+    const method = opts.method || 'GET';
+    if (method === 'POST') { writes.POST++; const b = JSON.parse(opts.body); return { ok: true, status: 201, json: async () => ({ id: 'new-id', name: b.name, target_date: b.target_date }) }; }
+    if (method === 'DELETE') { writes.DELETE++; return { ok: true, status: 204 }; }
+    return { ok: true, status: 403 };
+  };
+  const slowIt = (customId) => {
+    const x = fakeInteraction(customId);
+    x.update = async (c) => { await new Promise((r) => setTimeout(r, 30)); x.updated = c; };
+    return x;
+  };
+  try {
+    const okE = await mkCard('E2', '2099-01-01');
+    await Promise.all([handleAiConfirmOk(slowIt(okE)), handleAiConfirmOk(slowIt(okE))]);
+    ok(writes.POST === 1, `plane_ai_ok 連點兩下只建立一次（實際 POST ${writes.POST} 次）`);
+
+    pendingDeletes.set(USER, { id: 'del-1', name: 'X', due: '2099-01-01', expiresAt: Date.now() + 60_000 });
+    await Promise.all([handleDeleteConfirm(slowIt('plane_del_ok:del-1')), handleDeleteConfirm(slowIt('plane_del_ok:del-1'))]);
+    ok(writes.DELETE === 1, `plane_del_ok 連點兩下只刪除一次（實際 DELETE ${writes.DELETE} 次）`);
+  } finally {
+    global.fetch = realFetch;
+  }
 
   console.log(`selftest-ai-flow: ${n} checks passed`);
   process.exit(0);

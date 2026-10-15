@@ -333,6 +333,24 @@ const names = (calls) => calls.map((c) => c[0]);
     assert.match(j.fields.find((f) => f.name === '狀態').value, /^✅ 已加入 Plane：📚 強化學習專論 LAB1 - 2048（2026-09-27）\n.*new-id/);
   });
 
+  await testAsync('(j) ✅ 同一張卡連點兩下（第一次還在抓列表）→ 只建立一筆，第二次 followUp 處理中', async () => {
+    const first = fakeButton('plane_e3_ok', SPEC_EMBED);
+    const second = fakeButton('plane_e3_ok', SPEC_EMBED);
+    first.message.id = second.message.id = 'msg-dup-click';
+    const d = fakeDeps([]);
+    const slowFetch = d.fetchAllIssues;
+    d.fetchAllIssues = async () => { await new Promise((r) => setTimeout(r, 50)); return slowFetch(); };
+    await Promise.all([e3.handleE3Interaction(first, d), e3.handleE3Interaction(second, d)]);
+    assert.deepEqual(names(d.api), ['fetch', 'create']);
+    assert.deepEqual(names(second.calls), ['deferUpdate', 'followUp']);
+    assert.match(second.calls[1][1].content, /處理中/);
+    // 處理完解鎖：同一張卡之後再互動會照常處理（例如 API 失敗後重按）
+    const third = fakeButton('plane_e3_ok', SPEC_EMBED);
+    third.message.id = 'msg-dup-click';
+    await e3.handleE3Interaction(third, fakeDeps([]));
+    assert.deepEqual(names(third.calls), ['deferUpdate', 'message.edit']);
+  });
+
   await testAsync('(j) ✅ 同名同日 → 不建立、狀態 ℹ️、拿掉按鈕', async () => {
     const it = fakeButton('plane_e3_ok', SPEC_EMBED);
     const d = fakeDeps([{ id: 'dup', name: '📚 強化學習專論 LAB1 - 2048', target_date: '2026-09-27' }]);
