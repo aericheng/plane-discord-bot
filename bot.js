@@ -310,7 +310,7 @@ function escapeHtml(t) {
     .replace(/"/g, '&quot;');
 }
 
-async function createPlaneIssue({ name, due, label, desc }) {
+async function postPlaneIssue({ name, due, label, desc }) {
   const body = { name, target_date: due };
   if (label && label.id) body.labels = [label.id];
   if (desc) body.description_html = `<p>${escapeHtml(desc).replace(/\r?\n/g, '<br/>')}</p>`;
@@ -320,14 +320,58 @@ async function createPlaneIssue({ name, due, label, desc }) {
       method: 'POST',
       headers: { 'X-API-Key': PLANE.token, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(30000),
     }
   );
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Plane API ${res.status}: ${text.slice(0, 300)}`);
+    const err = new Error(`Plane API ${res.status}: ${text.slice(0, 300)}`);
+    err.planeStatus = res.status;
+    throw err;
   }
   return res.json();
+}
+
+// POST 逾時／連線中斷時，Plane 可能已經建好（2026-10-29「假日營老人驗」：15 秒逾時、伺服器端已建立）。
+// 這類錯誤不直接報失敗：重抓列表找「同名＋同 target_date＋送出後才建立」的 issue，找到就當成功
+// （回傳值加 recoveredAfterError），兩次都找不到才丟原錯誤。Plane 回 HTTP 錯誤碼（planeStatus）是明確失敗，照舊直接丟。
+const RECOVERY_WAITS_MS = [3000, 10000];
+const CREATED_AT_SLACK_MS = 2 * 60 * 1000; // 本機與 Plane 伺服器時鐘誤差的容忍
+// excludeIds：同一批已建立的 id（同批有同名同日時，避免把前一筆誤認成這一筆）。
+async function createWithRecovery(payload, { post, fetchAll, wait = sleep, now = Date.now, log = console.log, excludeIds = new Set() }) {
+  const startedAt = now();
+  try {
+    return await post(payload);
+  } catch (err) {
+    if (err.planeStatus) throw err;
+    log(`[bot] create ${payload.name} ${payload.due} transport error (${err.name}: ${err.message}), checking Plane list`);
+    for (const ms of RECOVERY_WAITS_MS) {
+      await wait(ms);
+      let issues;
+      try {
+        issues = await fetchAll();
+      } catch (listErr) {
+        log(`[bot] recovery list failed: ${listErr.message}`);
+        continue;
+      }
+      const hit = issues.find(
+        (i) => !excludeIds.has(i.id) && i.name === payload.name && i.target_date === payload.due &&
+          Date.parse(i.created_at) >= startedAt - CREATED_AT_SLACK_MS
+      );
+      if (hit) {
+        log(`[bot] recovered ${hit.id} after ${err.name}`);
+        return { ...hit, recoveredAfterError: err.message };
+      }
+    }
+    // AbortSignal.timeout 丟的是 DOMException，message 唯讀改不動，所以包一個新 Error（cause 帶原錯誤）
+    const wrapped = new Error(`${err.message}（逾時後重查 Plane 列表兩次都沒找到這筆）`, { cause: err });
+    wrapped.name = err.name;
+    throw wrapped;
+  }
+}
+
+function createPlaneIssue(payload, { excludeIds } = {}) {
+  return createWithRecovery(payload, { post: postPlaneIssue, fetchAll: fetchAllIssues, excludeIds });
 }
 
 // 更新單筆 issue 的截止日（E3 候選卡的「期限變更」路徑用）；只送 target_date，非 2xx 丟出與 createPlaneIssue 同格式錯誤。
@@ -422,8 +466,8 @@ async function finishCreate(session, desc, replyFn) {
 
   const created = [];
   for (const due of session.dates) {
-    const issue = await createPlaneIssue({ name: finalName, due, label, desc });
-    created.push({ due, id: issue.id });
+    const issue = await createPlaneIssue({ name: finalName, due, label, desc }, { excludeIds: new Set(created.map((c) => c.id)) });
+    created.push({ due, id: issue.id, recovered: !!issue.recoveredAfterError });
     if (session.dates.length > 1) await sleep(400);
   }
 
@@ -438,6 +482,8 @@ async function finishCreate(session, desc, replyFn) {
   }
   lines.push(`🏷️ label：${label.id ? label.name : '（無）'}`);
   if (desc) lines.push(`📝 description：已寫入`);
+  const recoveredCount = created.filter((c) => c.recovered).length;
+  if (recoveredCount > 0) lines.push(`🐢 Plane 回應逾時，其中 ${recoveredCount} 筆是重查列表確認已建立的（不用重送）。`);
   lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
   return replyFn(lines.join('\n'));
 }
@@ -522,9 +568,12 @@ async function createAiEvents(events) {
     const label = labelInfoFor(ev.label || 'remind');
     const finalName = label.emoji ? `${label.emoji} ${ev.name}` : ev.name;
     try {
-      const issue = await createPlaneIssue({ name: finalName, due: ev.due, label, desc: ev.desc || '' });
+      const issue = await createPlaneIssue(
+        { name: finalName, due: ev.due, label, desc: ev.desc || '' },
+        { excludeIds: new Set(results.filter((r) => r.ok).map((r) => r.id)) }
+      );
       // 成功回報一律取 POST 回應的欄位（不用 AI 事件物件），失敗回報才用送出值描述目標
-      results.push({ ok: true, name: issue.name, due: issue.target_date, id: issue.id });
+      results.push({ ok: true, name: issue.name, due: issue.target_date, id: issue.id, recovered: !!issue.recoveredAfterError });
     } catch (err) {
       results.push({ ok: false, name: finalName, due: ev.due, error: err.message });
     }
@@ -538,7 +587,7 @@ function buildAiCreateReport(results) {
   const failCount = results.length - okCount;
   const lines = [`✅ 已建立 ${okCount}/${results.length} 筆事件：`];
   for (const r of results) {
-    lines.push(r.ok ? `- ${r.name} — ${r.due}｜${issueUrl(r.id)}` : `- ❌ ${r.name} — ${r.due}｜失敗：${r.error}`);
+    lines.push(r.ok ? `- ${r.name} — ${r.due}｜${issueUrl(r.id)}${r.recovered ? '（Plane 回應逾時，重查確認已建立）' : ''}` : `- ❌ ${r.name} — ${r.due}｜失敗：${r.error}`);
   }
   if (failCount > 0) lines.push('', `⚠️ ${failCount} 筆失敗，請人工確認 Plane 上的實際狀態。`);
   lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
@@ -1145,6 +1194,7 @@ module.exports = {
   handleDelete,
   handleDeleteConfirm, // 測試用：模擬按下「確認刪除」按鈕，走完整 DELETE + read-back 流程
   createPlaneIssue, // 測試用：建立測試 issue 供刪除流程驗收
+  createWithRecovery, // 測試用：注入假的 post／fetchAll 驗逾時後重查
   deletePlaneIssue, // 測試用：清理測試資料
   pendingDeletes, // 測試用：可直接操作 expiresAt 驗證 60 秒過期邏輯，不用真的等 60 秒
   client, // 測試用：可直接 client.emit(...) 觸發真正註冊的 messageCreate/interactionCreate handler 做回歸測試
