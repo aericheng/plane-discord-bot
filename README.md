@@ -12,6 +12,15 @@
 
 中途打 `取消` 放棄、`幫助` 看用法。
 
+## 自然語言：建立、時間地點、改期修改、查重（[`BOT-SMART-SPEC.md`](BOT-SMART-SPEC.md)）
+
+非指令的訊息會交給 AI 判斷意圖（建立／查詢／刪除／修改），AI 只抽參數，所有寫入都走 bot 端的決定性管線：候選過濾 → 確認卡 → 按鈕 → API → read-back。前綴 `查`／`刪` 仍是不經 AI 的快速通道。
+
+- **自動帶時間地點**：「11/4（三）是假日營的老人驗 19:10 B02」會建出描述為 `時間：19:10` / `地點：B02` 的事件（Apps Script 同步後變成定時事件與地點欄位）；確認卡顯示 `🕒 19:10　📍 B02`。時間格式只收 `HH:MM` 或 `HH:MM~HH:MM`，抽不到就留空，不猜。
+- **改期／修改**：「今天的桌球考試改到下禮拜同個時間」「老人驗改到 B03」「桌球考試改成 19:30」。相對說法（延一週）由 bot 用原事件日期＋天數計算，AI 不算日期。找到候選後（多筆先選單）出「舊 → 新」確認卡，按 ✅ 才 PATCH（只送有變的欄位），完成後重抓列表逐欄 read-back。改名保留原本的 emoji 前綴；`時間：`／`地點：` 行取代或插在描述最前面，其他描述保留。60 秒沒按會過期。
+- **建立前查重**：AI 建立與逐步建立都先抓一次列表，同名（去 emoji、不分大小寫與全形空白）同日的不重複建立；AI 確認卡會預先標 `⚠️ 已有同名同日`，按確認時再比對一次。抓不到列表時不擋建立，回報加一行警告。
+- 每日／每週行程摘要（規格 D）尚未實作。純邏輯回歸：`npm run selftest`（含 `selftest-smart.js`）。
+
 ## E3 連動（候選期限確認卡）
 
 `e3-course-watch`（另一個專案，每天巡檢 NYCU E3 的腳本）發現有截止日的新作業或公告後，用**本 bot 的 token** 在 `#e3-bot` 貼一張「候選卡」（embed＋三顆按鈕）；本 bot 收到按鈕互動後，只從卡片的 embed 讀回欄位、去重、寫進 Plane。沒按按鈕就永遠不會進 Plane。卡片格式與互動規則以 [`BOT-E3-INTAKE-SPEC.md`](BOT-E3-INTAKE-SPEC.md) 為唯一契約，兩邊改欄位都要同步改它；bot 端實作在 `e3-intake.js`。
@@ -31,6 +40,17 @@
 - Plane API 失敗 → 卡片不動、按鈕保留，錯誤只用 ephemeral 訊息告訴你，可以再按一次
 
 這些互動只檢查 `ALLOWED_USER_ID`，不套 `ALLOWED_CHANNEL_ID`（卡片在 `#e3-bot`，不在對話頻道）。純邏輯回歸：`node selftest-e3-intake.js`（不連 Discord、不打 Plane）。
+
+## 每日／每週行程摘要
+
+bot 自己排時間（Asia/Taipei，不靠 Windows 排程），發到 `ALLOWED_CHANNEL_ID` 頻道：
+
+- 每天 07:30：今天＋明天的事件；兩天都沒有事件就不發（log 寫 `digest daily skipped ... reason=empty`）
+- 每週日 21:00：下週一到週日，依日期分組並標星期（`digest weekly sent week=... items=N`）
+- 每筆一行 `名稱 🕒時間 📍地點`（時間地點讀描述的 `時間：`／`地點：` 行）；💯 考試、📚 作業排當天最前面；另列最多 5 筆已過期但未完成的 💯／📚；Plane state group 為 completed／cancelled 的不列
+- 補發：bot 在 07:30–12:00 之間啟動、而今天還沒發過，就補發一次；已發日期記在 `data/digest-state.json`（gitignore），不會重複發
+- 預覽（唯讀、不發 Discord、不寫狀態檔）：`node scripts/digest-preview.js [--weekly] [--date YYYY-MM-DD]`
+- 純邏輯自測：`node selftest-digest.js`（已含在 `npm run selftest`）
 
 ## 安裝
 

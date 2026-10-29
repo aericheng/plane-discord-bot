@@ -1,5 +1,6 @@
 // 確認卡／澄清／補日期的過期行為自測（純 node、不連網、不呼叫 claude -p、不碰 Plane API）
 const bot = require('./bot');
+bot.smartHooks.fetchAll = async () => []; // 查重列表由假資料提供，selftest 不連網
 const { handleDeleteConfirm, pendingDeletes } = bot;
 const { client, aiFlows, pendingCards, aiInFlight, presentAiConfirmOrEmpty, handleAiConfirmOk, handleAiConfirmNo, clearAiState } = bot;
 

@@ -21,6 +21,8 @@ const {
 const crypto = require('node:crypto');
 const { runAiParse, killActiveClaudeChildren, taipeiTodayInfo } = require('./ai-intake');
 const { isE3Interaction, handleE3Interaction } = require('./e3-intake');
+const smart = require('./smart-edit');
+const digest = require('./digest');
 
 // 全域錯誤 handler：單一 promise 失敗只記 log；同步例外記 log 後以 exit 1 結束交給 start-bot.cmd 重啟
 process.on('unhandledRejection', (reason) => {
@@ -63,6 +65,10 @@ const SKIP_WORDS = ['跳過', '無', '沒有', 'skip', 'no', '不用'];
 const HELP_TEXT = [
   '**用法（AI 模式，預設）**：直接丟一段自由文字給我（可以一次講幾件事），我會用 AI 抽出裡面的事件，列出確認卡讓你按按鈕確認，才會真的寫進 Plane。',
   '- 也可以直接用自然語言查詢或刪除，例如「幫我刪掉8/1的古」「告訴我8/1有哪些行程」「8/12有微積分考試」；前綴 `查`/`刪` 是快速通道（不用等 AI）。',
+  '- 也能用自然語言改期或修改：「今天的桌球考試改到下禮拜同個時間」「老人驗改到 B03」「11/4 的老人驗改成 19:30」。會先列出「舊 → 新」讓你按確認，60 秒沒按會過期。',
+  '- 建立事件時，句子裡的時間和地點會自動存進描述（`時間：19:10`、`地點：B02`），Google 日曆同步後會變成定時事件和地點欄位；確認卡會顯示 🕒 時間、📍 地點。',
+  '- **每日／每週摘要**：我會自己在這個頻道貼行程。每天 07:30 貼今天＋明天（兩天都沒事就不貼），每週日 21:00 貼下週一到週日（按日期分組、標星期）；💯 考試、📚 作業排在當天最前面，另列最多 5 筆已過期但未完成的 💯／📚，已完成或已取消的不會出現。bot 在 07:30–12:00 之間重啟、而今天還沒貼過時會補貼一次（不會重複貼）。',
+  '- 建立前會先查重：同名同一天已經有的事件不會重複建立，確認卡也會先標示。',
   '- 確認卡 24 小時內按都有效（bot 重啟或打 `取消` 會讓它失效），擺著沒按也不影響你繼續丟新的文字。',
   '- 缺日期的事件，按確認後我會逐筆問你。文字看不出明確內容時，我可能會先反問一次澄清（最多一輪）。這兩種「等你回答」的狀態 10 分鐘沒回就作廢，之後的訊息當新的一則處理。',
   '- AI 暫時不可用時：短文字（40 字以內）會自動退回下面的「逐步模式」；長文字會請你稍後再試。',
@@ -93,6 +99,15 @@ const sessions = new Map(); // userId -> { step: 'due'|'label'|'desc', name, dat
 const pendingDeletes = new Map();
 // 刪除候選清單（多筆待使用者用選單挑一筆）：userId -> { byId: Map(id -> issue), expiresAt }
 const pendingDeleteLists = new Map();
+
+// 改期／修改待確認（BOT-SMART-SPEC.md §A）：cardId -> { userId, issue, plan, expiresAt }（單筆確認卡）
+//                                        或 { userId, byId, changes, expiresAt }（多筆候選，等選單挑一筆）
+const pendingUpdates = new Map();
+const UPDATE_TTL_MS = 60_000;
+// 同一則訊息（message.id）處理中的第二次按鈕互動直接擋掉（寫法參考 e3-intake.js 的 inFlight）。
+const buttonInFlight = new Set();
+// 可注入的外部依賴（selftest 用，避免單元測試連網）。
+const smartHooks = { fetchAll: () => fetchAllIssues(), wait: (ms) => sleep(ms) };
 
 // ===== AI 自由文字解析的暫存狀態（BOT-AI-INTAKE-SPEC.md） =====
 // 進行中的 AI 呼叫鎖：userId -> true（同一使用者同時只能有一個 claude -p 在跑）。
@@ -392,6 +407,36 @@ async function updatePlaneIssue(issueId, { target_date }) {
   return res.json();
 }
 
+// 改期／修改用的 PATCH：只送有變的欄位。非 2xx 帶 planeStatus（明確失敗）；逾時／斷線沒有 planeStatus（交給 patchWithRecovery 重查）。
+async function patchPlaneIssue(issueId, patch) {
+  const res = await fetch(
+    `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/${issueId}/`,
+    {
+      method: 'PATCH',
+      headers: { 'X-API-Key': PLANE.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+      signal: AbortSignal.timeout(15000),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    const err = new Error(`Plane API ${res.status}: ${text.slice(0, 300)}`);
+    err.planeStatus = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+// 建立前查重用：抓一次列表；失敗不擋建立，issues 回 null 讓呼叫端加警告行。
+async function loadDupCheckList() {
+  try {
+    return { issues: await smartHooks.fetchAll() };
+  } catch (err) {
+    console.error('[bot] dup-check list failed:', err.message);
+    return { issues: null };
+  }
+}
+
 function issueUrl(issueId) {
   return `https://app.plane.so/${PLANE.workspace}/projects/${PLANE.project}/issues/${issueId}`;
 }
@@ -406,7 +451,14 @@ async function fetchAllIssues() {
   let page = 0;
   while (true) {
     const url = `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/?per_page=100&cursor=100:${page}:0`;
-    const res = await fetch(url, { headers: { 'X-API-Key': PLANE.token }, signal: AbortSignal.timeout(15000) });
+    // 2026-10-29 實測：同一支列表 API 單頁偶爾要 18 秒，15 秒逾時會讓整批查詢／查重失敗；逾時時同頁重試一次。
+    let res;
+    try {
+      res = await fetch(url, { headers: { 'X-API-Key': PLANE.token }, signal: AbortSignal.timeout(15000) });
+    } catch (err) {
+      if (err.name !== 'TimeoutError') throw err;
+      res = await fetch(url, { headers: { 'X-API-Key': PLANE.token }, signal: AbortSignal.timeout(25000) });
+    }
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Plane API ${res.status}: ${text.slice(0, 300)}`);
@@ -418,6 +470,20 @@ async function fetchAllIssues() {
     await sleep(400);
   }
   return all;
+}
+
+// 唯讀：project 的 states → { stateId: group }（group：backlog／unstarted／started／completed／cancelled）。
+// 2026-10-29 實測 GET .../projects/<project>/states/ 回 { results:[{id,name,group,default}] }；摘要用 group 排除已完成／已取消。
+async function fetchPlaneStates() {
+  const res = await fetch(`${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/states/`, {
+    headers: { 'X-API-Key': PLANE.token },
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!res.ok) throw new Error(`Plane API ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  const j = await res.json();
+  const map = {};
+  for (const st of j.results || j || []) map[st.id] = st.group;
+  return map;
 }
 
 async function deletePlaneIssue(issueId) {
@@ -464,27 +530,45 @@ async function finishCreate(session, desc, replyFn) {
   const label = session.label;
   const finalName = label.emoji ? `${label.emoji} ${session.name}` : session.name;
 
+  // 建立前查重（一批只抓一次列表）：同名（e3-intake 的名稱正規化）同日已有的日期跳過。
+  const dupList = await loadDupCheckList();
   const created = [];
+  const skipped = [];
   for (const due of session.dates) {
+    const dup = dupList.issues ? smart.findDuplicates(dupList.issues, { name: finalName, due }) : [];
+    if (dup.length) {
+      skipped.push({ due, id: dup[0].id });
+      continue;
+    }
     const issue = await createPlaneIssue({ name: finalName, due, label, desc }, { excludeIds: new Set(created.map((c) => c.id)) });
     created.push({ due, id: issue.id, recovered: !!issue.recoveredAfterError });
     if (session.dates.length > 1) await sleep(400);
   }
 
-  const lines = [`✅ 已建立 ${created.length} 個事件：**${finalName}**`];
-  if (created.length === 1) {
-    lines.push(`📅 Due date：${created[0].due}`);
-    lines.push(`🔗 ${issueUrl(created[0].id)}`);
+  const lines = [];
+  if (created.length === 0) {
+    lines.push(`ℹ️ **${finalName}** 在 ${skipped.map((k) => k.due).join('、')} 都已經有同名事件了，沒有建立新事件。`);
+    lines.push(`🔗 既有：${issueUrl(skipped[0].id)}`);
   } else {
-    const shown = created.map((c) => c.due);
-    lines.push(`📅 日期：${shown.length <= 12 ? shown.join('、') : `${shown[0]} ~ ${shown[shown.length - 1]}`}`);
-    lines.push(`🔗 第一筆：${issueUrl(created[0].id)}`);
+    lines.push(skipped.length > 0
+      ? `✅ 建立 ${created.length} 筆，略過 ${skipped.length} 筆已有：**${finalName}**`
+      : `✅ 已建立 ${created.length} 個事件：**${finalName}**`);
+    if (created.length === 1) {
+      lines.push(`📅 Due date：${created[0].due}`);
+      lines.push(`🔗 ${issueUrl(created[0].id)}`);
+    } else {
+      const shown = created.map((c) => c.due);
+      lines.push(`📅 日期：${shown.length <= 12 ? shown.join('、') : `${shown[0]} ~ ${shown[shown.length - 1]}`}`);
+      lines.push(`🔗 第一筆：${issueUrl(created[0].id)}`);
+    }
+    if (skipped.length > 0) lines.push(`⏭️ 已有、略過：${skipped.map((k) => k.due).join('、')}`);
   }
+  if (!dupList.issues) lines.push('⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');
   lines.push(`🏷️ label：${label.id ? label.name : '（無）'}`);
-  if (desc) lines.push(`📝 description：已寫入`);
+  if (desc && created.length > 0) lines.push(`📝 description：已寫入`);
   const recoveredCount = created.filter((c) => c.recovered).length;
   if (recoveredCount > 0) lines.push(`🐢 Plane 回應逾時，其中 ${recoveredCount} 筆是重查列表確認已建立的（不用重送）。`);
-  lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
+  if (created.length > 0) lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
   return replyFn(lines.join('\n'));
 }
 
@@ -504,7 +588,13 @@ function startStepwiseSession(userId, text) {
 }
 
 // AI 不可用（spawn 失敗／逾時／二次 JSON 修復仍失敗）時的 fallback：短文字轉逐步模式，長文字請重試。
+// 文字看起來是改期／修改時不能進「建立」模式（會建出一筆名叫「桌球考試改到下週」的垃圾事件）；
+// 用決定性關鍵字判斷，不靠 AI。
+const EDIT_LIKE_RE = /改到|改成|改為|改期|延到|延後|延期|順延|提前|換到|調到|挪到|往後(?:延|挪)|往前(?:挪|移)/;
 function aiFallbackContent(userId, originalText) {
+  if (EDIT_LIKE_RE.test(originalText)) {
+    return '⚠️ AI 暫時不可用，改期請稍後再試，或到 Plane 手動修改。';
+  }
   if (originalText.length <= 40) {
     return ['⚠️ AI 解析暫時不可用，改用逐步模式。', startStepwiseSession(userId, originalText)].join('\n');
   }
@@ -524,23 +614,39 @@ function labelInfoFor(labelName) {
   return LABELS.find((l) => l.name === labelName) || LABELS.find((l) => l.name === 'remind');
 }
 
-function cardLineFor(ev, idx, todayIso) {
+function cardLineFor(ev, idx, todayIso, isDup = false, sameCard = false) {
   const info = labelInfoFor(ev.label || 'remind');
   const labelSuffix = ev.label ? '' : '（預設）';
   let dueDisplay;
   if (!ev.due) dueDisplay = '❓需要日期';
   else if (ev.due < todayIso) dueDisplay = `⚠️ ${ev.due}（已過去）`;
   else dueDisplay = ev.due;
-  return `${idx + 1}. ${info.emoji ? info.emoji + ' ' : ''}${ev.name} — ${dueDisplay}${labelSuffix}`;
+  const out = [`${idx + 1}. ${info.emoji ? info.emoji + ' ' : ''}${ev.name} — ${dueDisplay}${labelSuffix}`];
+  const tl = [ev.time ? `🕒 ${ev.time}` : '', ev.location ? `📍 ${ev.location}` : ''].filter(Boolean).join('　');
+  if (tl) out.push(`   ${tl}`);
+  if (isDup) out.push('   ⚠️ 已有同名同日（不會重複建立）');
+  else if (sameCard) out.push('   ⚠️ 與上面同名同日（只會建立一筆）');
+  return out.join('\n');
 }
 
 // 組確認卡文字。若顯示不完整（超過 Discord 2000 字上限）不做截斷顯示——寧可拒絕也不能讓使用者
 // 在沒看到全部內容的情況下按下確認鈕，回傳 tooLong 讓呼叫端改請使用者分段丟文字。
-function buildConfirmCard(events) {
+// existing：fetchAllIssues() 的結果（用來預先標示同名同日）；dupCheckFailed：抓不到列表時加警告行。
+function buildConfirmCard(events, { existing = null, dupCheckFailed = false } = {}) {
   const sorted = sortEventsForCard(events);
   const todayIso = taipeiTodayInfo().iso;
   const header = `🤖 從你的文字抽出 ${events.length} 筆事件：`;
-  const lines = sorted.map((e, i) => cardLineFor(e, i, todayIso));
+  const seenKeys = new Set(); // 同一張卡內兩筆同名同日（正規化後）：只有第一筆會建
+  const lines = sorted.map((e, i) => {
+    const emoji = labelInfoFor(e.label || 'remind').emoji;
+    const finalName = emoji ? `${emoji} ${e.name}` : e.name;
+    const isDup = !!existing && smart.findDuplicates(existing, { name: finalName, due: e.due }).length > 0;
+    const key = smart.dupKey(finalName, e.due);
+    const sameCard = !!key && seenKeys.has(key);
+    if (key) seenKeys.add(key);
+    return cardLineFor(e, i, todayIso, isDup, sameCard);
+  });
+  if (dupCheckFailed) lines.push('⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');
   const text = [header, ...lines].join('\n');
   if (text.length > 1900) return { tooLong: true, events: sorted };
   return { tooLong: false, text, events: sorted };
@@ -564,16 +670,32 @@ function parseAiCardCustomId(customId) {
 async function createAiEvents(events) {
   const sorted = sortEventsForCard(events);
   const results = [];
+  const dupList = await loadDupCheckList(); // 一批只抓一次；按確認時再比對一次（卡片出現後可能有人建了）
+  if (!dupList.issues) results.dupCheckFailed = true;
+  const createdByKey = new Map(); // 本批已建立成功的 key -> 結果；同批第二筆同名同日直接略過
   for (const ev of sorted) {
     const label = labelInfoFor(ev.label || 'remind');
     const finalName = label.emoji ? `${label.emoji} ${ev.name}` : ev.name;
+    const dup = dupList.issues ? smart.findDuplicates(dupList.issues, { name: finalName, due: ev.due }) : [];
+    if (dup.length > 0) {
+      results.push({ ok: true, skipped: true, name: dup[0].name, due: dup[0].target_date, id: dup[0].id });
+      continue;
+    }
+    const key = smart.dupKey(finalName, ev.due);
+    const sameBatch = key ? createdByKey.get(key) : null;
+    if (sameBatch) {
+      results.push({ ok: true, skipped: true, name: sameBatch.name, due: sameBatch.due, id: sameBatch.id });
+      continue;
+    }
     try {
       const issue = await createPlaneIssue(
-        { name: finalName, due: ev.due, label, desc: ev.desc || '' },
+        { name: finalName, due: ev.due, label, desc: smart.buildDescText({ time: ev.time, location: ev.location, desc: ev.desc }) },
         { excludeIds: new Set(results.filter((r) => r.ok).map((r) => r.id)) }
       );
       // 成功回報一律取 POST 回應的欄位（不用 AI 事件物件），失敗回報才用送出值描述目標
-      results.push({ ok: true, name: issue.name, due: issue.target_date, id: issue.id, recovered: !!issue.recoveredAfterError });
+      const res = { ok: true, name: issue.name, due: issue.target_date, id: issue.id, recovered: !!issue.recoveredAfterError };
+      results.push(res);
+      if (key) createdByKey.set(key, res);
     } catch (err) {
       results.push({ ok: false, name: finalName, due: ev.due, error: err.message });
     }
@@ -583,14 +705,19 @@ async function createAiEvents(events) {
 }
 
 function buildAiCreateReport(results) {
-  const okCount = results.filter((r) => r.ok).length;
-  const failCount = results.length - okCount;
-  const lines = [`✅ 已建立 ${okCount}/${results.length} 筆事件：`];
+  const skippedCount = results.filter((r) => r.skipped).length;
+  const okCount = results.filter((r) => r.ok && !r.skipped).length;
+  const failCount = results.filter((r) => !r.ok).length;
+  const lines = [
+    skippedCount > 0 ? `✅ 建立 ${okCount} 筆，略過 ${skippedCount} 筆已有：` : `✅ 已建立 ${okCount}/${results.length} 筆事件：`,
+  ];
   for (const r of results) {
-    lines.push(r.ok ? `- ${r.name} — ${r.due}｜${issueUrl(r.id)}${r.recovered ? '（Plane 回應逾時，重查確認已建立）' : ''}` : `- ❌ ${r.name} — ${r.due}｜失敗：${r.error}`);
+    if (r.skipped) lines.push(`- ⏭️ 已有：${r.name} — ${r.due}｜${issueUrl(r.id)}`);
+    else lines.push(r.ok ? `- ${r.name} — ${r.due}｜${issueUrl(r.id)}${r.recovered ? '（Plane 回應逾時，重查確認已建立）' : ''}` : `- ❌ ${r.name} — ${r.due}｜失敗：${r.error}`);
   }
   if (failCount > 0) lines.push('', `⚠️ ${failCount} 筆失敗，請人工確認 Plane 上的實際狀態。`);
-  lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
+  if (results.dupCheckFailed) lines.push('', '⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');
+  if (okCount > 0) lines.push('', 'Google 日曆會在整點同步時出現（最慢 1 小時）。');
   return lines.join('\n');
 }
 
@@ -602,7 +729,8 @@ async function presentAiConfirmOrEmpty(placeholder, userId, events, originalText
       `🤖 我看不出這段文字裡有事件（原文共 ${originalText.length} 字）。可以換個說法，或直接傳簡短事件名稱走逐步模式。`
     );
   }
-  const card = buildConfirmCard(events);
+  const dupList = await loadDupCheckList(); // 出卡前預先比對同名同日（失敗不擋，卡上加警告）
+  const card = buildConfirmCard(events, { existing: dupList.issues, dupCheckFailed: !dupList.issues });
   if (card.tooLong) {
     aiFlows.delete(userId);
     return placeholder.edit(
@@ -622,11 +750,12 @@ async function presentAiConfirmOrEmpty(placeholder, userId, events, originalText
 // （runAiDelete 需要正確的 author.id 來鍵值 pendingDeletes/pendingDeleteLists）。
 async function dispatchByIntent(placeholder, originalMsg, userId, normalized, originalText) {
   const { intent, query, events } = normalized;
+  if (intent === 'update') return runAiUpdate(placeholder, originalMsg, normalized);
   if (intent === 'query') return runAiQuery(placeholder, query);
   if (intent === 'delete') return runAiDelete(placeholder, originalMsg, query);
   if (intent === 'unknown') {
     return placeholder.edit(
-      ['🤖 看不出你要建立、查詢還是刪除。', '可以說「幫我刪掉8/1的古」「告訴我8/1有哪些行程」「8/12有微積分考試」。'].join('\n')
+      ['🤖 看不出你要建立、查詢、刪除還是修改。', '可以說「幫我刪掉8/1的古」「告訴我8/1有哪些行程」「8/12有微積分考試」「老人驗改到 B03」。'].join('\n')
     );
   }
   return presentAiConfirmOrEmpty(placeholder, userId, events, originalText);
@@ -721,6 +850,25 @@ const AI_CARD_GONE_TEXT = '這張確認卡已失效（超過 24 小時、已取�
 
 // 按下確認卡「✅ 全部建立」：若有缺日期的事件先逐筆問，問完才真正建立。
 async function handleAiConfirmOk(interaction) {
+  return withButtonLock(interaction, () => handleAiConfirmOkInner(interaction));
+}
+
+// 同一則訊息（message.id）處理中的第二次互動擋掉：回 ephemeral「處理中」；finally 解鎖。
+async function withButtonLock(interaction, fn) {
+  const key = interaction.message && interaction.message.id;
+  if (key && buttonInFlight.has(key)) {
+    console.log(`[bot] duplicate button interaction ignored (message ${key})`);
+    return interaction.reply({ content: '⏳ 這張卡正在處理中，請勿重複按。', ephemeral: true });
+  }
+  if (key) buttonInFlight.add(key);
+  try {
+    return await fn();
+  } finally {
+    if (key) buttonInFlight.delete(key);
+  }
+}
+
+async function handleAiConfirmOkInner(interaction) {
   const { authorId, cardId } = parseAiCardCustomId(interaction.customId);
   if (interaction.user.id !== authorId) {
     return interaction.reply({ content: '這張確認卡不是給你的。', ephemeral: true });
@@ -797,9 +945,168 @@ async function handleQuery(msg, argText) {
 
 // AI intent=query：把 AI 的 query 物件轉成內部格式，餵同一個核心，edit 掉「解析中」placeholder。
 async function runAiQuery(placeholder, aiQuery) {
-  const q = aiQueryToInternal(aiQuery) || { type: 'keyword', keyword: '' };
+  const q = aiQueryToInternal(aiQuery);
+  if (!q) return placeholder.edit(aiUnusableHelpText('query')); // 空條件不能變成 keyword '' 比對全部事件
   const content = await buildQueryReplyContent(q);
   return placeholder.edit(content);
+}
+
+// ===== 改期／修改（intent=update，BOT-SMART-SPEC.md §A） =====
+// AI 結果在澄清一輪（只澄清一次）後仍不合法時的說明文字：update 看 changes（至少一項、due 與 shift_days 不可並存），
+// query／delete 的空條件由呼叫端（aiQueryToInternal 回 null）判斷。changes 為 undefined 代表只回通用說明。
+function aiUnusableHelpText(intent, changes) {
+  if (intent === 'update') {
+    const c = changes || {};
+    const hasChange = !!(c.due || c.shift_days || c.name || c.time || c.location);
+    if (changes && hasChange && !(c.due && c.shift_days)) return null;
+    return ['🤖 看不懂要改哪一筆、改成什麼，這次先不動任何資料。', '可以這樣說：「今天的桌球考試改到下禮拜同個時間」「老人驗改到 B03」「8/1 的古改成 8/8」。'].join('\n');
+  }
+  const verb = intent === 'delete' ? '刪' : '查';
+  return [`🤖 看不懂要${verb}哪一筆（沒有日期也沒有關鍵字），這次先不動任何資料。`, intent === 'delete' ? '可以這樣說：「幫我刪掉8/1的古」。' : '可以這樣說：「告訴我8/1有哪些行程」。'].join('\n');
+}
+
+function buildUpdateConfirmRow(cardId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`plane_upd_ok:${cardId}`).setLabel('✅ 確認修改').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`plane_upd_no:${cardId}`).setLabel('❌ 取消').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+// 出錯時清掉該使用者所有待確認的修改卡／候選（pendingUpdates 以 cardId 為 key，要掃 userId）。
+function clearPendingUpdatesFor(userId) {
+  for (const [id, c] of pendingUpdates) if (c.userId === userId) pendingUpdates.delete(id);
+}
+
+function sweepPendingUpdates() {
+  const now = Date.now();
+  for (const [id, c] of pendingUpdates) if (now > c.expiresAt) pendingUpdates.delete(id);
+}
+
+// 單筆鎖定後：算出 plan，登記確認卡，回傳 { content, components } 或 { content }（無法／不需修改）。
+function buildUpdateConfirmPayload(userId, issue, changes) {
+  const plan = smart.planUpdate(issue, changes);
+  if (plan.error) return { content: `⚠️ ${plan.error}` };
+  if (plan.noChange) return { content: `ℹ️ 「${issue.name}」（${issue.target_date}）已經是你要的樣子了，不需要修改。` };
+  sweepPendingUpdates();
+  const cardId = crypto.randomBytes(6).toString('hex');
+  pendingUpdates.set(cardId, { userId, issue, plan, expiresAt: Date.now() + UPDATE_TTL_MS });
+  return { content: smart.buildUpdateCardText(issue, plan), components: [buildUpdateConfirmRow(cardId)] };
+}
+
+function presentUpdateChoices(msg, issues, changes) {
+  sweepPendingUpdates();
+  const cardId = crypto.randomBytes(6).toString('hex');
+  pendingUpdates.set(cardId, { userId: msg.author.id, byId: new Map(issues.map((i) => [i.id, i])), changes, expiresAt: Date.now() + UPDATE_TTL_MS });
+  const menu = new StringSelectMenuBuilder().setCustomId(`plane_upd_pick:${cardId}`).setPlaceholder('選一筆要修改的事件');
+  for (const i of issues) {
+    const label = `${mdPadded(i.target_date)} ${i.name}`.slice(0, 100);
+    menu.addOptions(new StringSelectMenuOptionBuilder().setLabel(label).setValue(i.id));
+  }
+  return msg.reply({
+    content: `🔍 找到 ${issues.length} 筆符合的事件，請選一筆要修改的：`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+// 候選過濾與刪除共用 resolveDeleteMatches（同一個入口，不重寫過濾）。
+async function runAiUpdate(placeholder, originalMsg, normalized) {
+  if (!process.env.ALLOWED_USER_ID) {
+    return placeholder.edit('⚠️ 修改功能目前停用：請先在 `.env` 設定 `ALLOWED_USER_ID`（填入你的 Discord user id）後再試一次。');
+  }
+  const q = aiQueryToInternal(normalized.query);
+  const helpText = aiUnusableHelpText('update', normalized.changes);
+  if (!q || helpText) return placeholder.edit(helpText || aiUnusableHelpText('update'));
+  const label = describeQuery(q);
+  try {
+    const matched = await resolveDeleteMatches(q);
+    if (matched.length === 0) return placeholder.edit(`🔍 找不到符合「${label}」的事件。`);
+    if (matched.length > 25) {
+      return placeholder.edit(`🔍 找到 ${matched.length} 筆符合的事件，超過選單上限 25 筆，請縮小範圍再試一次。`);
+    }
+    await placeholder.edit(`🔍 找到符合「${label}」的事件，請看下面：`);
+    if (matched.length === 1) {
+      return originalMsg.reply(buildUpdateConfirmPayload(originalMsg.author.id, matched[0], normalized.changes));
+    }
+    return presentUpdateChoices(originalMsg, matched, normalized.changes);
+  } catch (err) {
+    console.error('[bot] runAiUpdate error:', err);
+    return placeholder.edit(`❌ 修改流程出錯：${err.message}`);
+  }
+}
+
+async function handleUpdatePick(interaction) {
+  const cardId = interaction.customId.slice('plane_upd_pick:'.length);
+  const pending = pendingUpdates.get(cardId);
+  pendingUpdates.delete(cardId);
+  if (!pending || pending.userId !== interaction.user.id || !pending.byId || Date.now() > pending.expiresAt) {
+    return interaction.update({ content: '已過期，請重新下指令。', components: [] });
+  }
+  const issue = pending.byId.get(interaction.values[0]);
+  if (!issue) return interaction.update({ content: '找不到這筆資料，請重新下指令。', components: [] });
+  const payload = buildUpdateConfirmPayload(interaction.user.id, issue, pending.changes);
+  return interaction.update({ components: [], ...payload });
+}
+
+async function handleUpdateCancel(interaction) {
+  pendingUpdates.delete(interaction.customId.slice('plane_upd_no:'.length));
+  return interaction.update({ content: '已取消修改。', components: [] });
+}
+
+// 按下「確認修改」：PATCH（只送變動欄位；逾時重查）→ 重抓列表 read-back 逐欄比對 → 回報。
+async function handleUpdateConfirm(interaction) {
+  return withButtonLock(interaction, () => handleUpdateConfirmInner(interaction));
+}
+
+async function handleUpdateConfirmInner(interaction) {
+  const cardId = interaction.customId.slice('plane_upd_ok:'.length);
+  const pending = pendingUpdates.get(cardId);
+  if (!pending || pending.userId !== interaction.user.id || !pending.plan || Date.now() > pending.expiresAt) {
+    pendingUpdates.delete(cardId);
+    return interaction.update({ content: '已過期，請重新下指令。', components: [] });
+  }
+  pendingUpdates.delete(cardId); // 同步消耗
+  const { issue, plan } = pending;
+  await interaction.update({ content: `⏳ 修改中…（${issue.name}）`, components: [] });
+
+  let recovered = false;
+  try {
+    const r = await smart.patchWithRecovery(
+      { issueId: issue.id, patch: plan.patch, expected: plan.expected },
+      { send: patchPlaneIssue, fetchAll: smartHooks.fetchAll, wait: smartHooks.wait }
+    );
+    recovered = r.recovered;
+  } catch (err) {
+    return interaction.editReply(`❌ 修改失敗：${err.message}`);
+  }
+
+  // read-back：重抓列表找同 id 逐欄比對；列表有索引延遲，不一致時等一下再抓一次才下結論。
+  let bad = null;
+  let readbackError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await smartHooks.wait(attempt === 0 ? 400 : 2500);
+    try {
+      const all = await smartHooks.fetchAll();
+      const hit = all.find((i) => i.id === issue.id);
+      bad = hit ? smart.verifyIssueFields(hit, plan.expected) : [{ field: '整筆', expected: '存在', actual: '列表找不到' }];
+      readbackError = null;
+      if (bad.length === 0) break;
+    } catch (err) {
+      readbackError = err;
+    }
+  }
+  if (readbackError && bad === null) {
+    return interaction.editReply(`⚠️ 已送出修改，但 read-back 檢查出錯：${readbackError.message}，請人工確認 Plane 上的實際狀態。`);
+  }
+  if (bad && bad.length > 0) {
+    const detail = bad.map((b) => `${b.field}（預期 ${b.expected}，實際 ${b.actual === null ? '（無）' : b.actual}）`).join('、');
+    return interaction.editReply(`⚠️ 已送出修改，但 read-back 發現這些欄位沒改到：${detail}。請人工確認 Plane 上的實際狀態。\nid：${issue.id}`);
+  }
+  const newName = plan.expected.name || issue.name;
+  const dateText = plan.expected.target_date ? `${issue.target_date} → ${plan.expected.target_date}` : `${issue.target_date}（日期不變）`;
+  const changedFields = plan.rows.filter((r) => r.changed).map((r) => r.field).join('、');
+  return interaction.editReply(
+    [`✏️ 已修改：${newName}｜${dateText}｜${issueUrl(issue.id)}`, `改了：${changedFields}（read-back 確認已是新值）${recovered ? '（Plane 回應逾時，重查確認已生效）' : ''}`].join('\n')
+  );
 }
 
 // ===== 刪除（`刪 ...`） =====
@@ -884,7 +1191,8 @@ async function runAiDelete(placeholder, originalMsg, aiQuery) {
   if (!process.env.ALLOWED_USER_ID) {
     return placeholder.edit('⚠️ 刪除功能目前停用：請先在 `.env` 設定 `ALLOWED_USER_ID`（填入你的 Discord user id）後再試一次。');
   }
-  const q = aiQueryToInternal(aiQuery) || { type: 'keyword', keyword: '' };
+  const q = aiQueryToInternal(aiQuery);
+  if (!q) return placeholder.edit(aiUnusableHelpText('delete')); // 空條件不能變成 keyword '' 比對全部事件
   const label = describeQuery(q);
   try {
     const matched = await resolveDeleteMatches(q);
@@ -996,14 +1304,35 @@ client.on('shardDisconnect', (ev, id) => console.warn(`[bot] shard ${id} disconn
 client.on('shardResume', (id) => console.log(`[bot] shard ${id} resumed`));
 client.on('warn', (m) => console.warn('[bot] discord warn:', m));
 
+// 只有空白視為沒設。
+function allowedChannelId() {
+  return String(process.env.ALLOWED_CHANNEL_ID || '').trim();
+}
+
+// 每日／每週行程摘要（BOT-SMART-SPEC.md §D）：發到 ALLOWED_CHANNEL_ID；bot 內部計時，重啟時視情況補發。
+const digestRunner = digest.createDigestRunner({
+  fetchAll: () => smartHooks.fetchAll(),
+  fetchStates: fetchPlaneStates,
+  priorityLabelIds: LABELS.filter((l) => l.name === 'test' || l.name === 'homework').map((l) => l.id),
+  send: async (text) => {
+    const channel = await client.channels.fetch(allowedChannelId());
+    await digest.sendToChannel(channel, text);
+  },
+});
+
 client.on('clientReady', () => {
   console.log(`[bot] logged in as ${client.user.tag} at ${new Date().toISOString()}`);
+  if (!allowedChannelId()) {
+    console.warn('[bot] digest disabled: ALLOWED_CHANNEL_ID not set');
+    return;
+  }
+  digestRunner.start().catch((err) => console.error('[bot] digest start failed:', err && err.stack ? err.stack : err));
 });
 
 client.on('messageCreate', async (msg) => {
   try {
     if (msg.author.bot) return;
-    if (process.env.ALLOWED_CHANNEL_ID && msg.channelId !== process.env.ALLOWED_CHANNEL_ID) return;
+    if (allowedChannelId() && msg.channelId !== allowedChannelId()) return;
     if (process.env.ALLOWED_USER_ID && msg.author.id !== process.env.ALLOWED_USER_ID) return;
 
     const text = msg.content.trim();
@@ -1056,7 +1385,7 @@ client.on('messageCreate', async (msg) => {
         if (session.dates.length > 1) {
           await msg.reply(`⏳ 建立 ${session.dates.length} 筆中…`);
         }
-        return finishCreate(session, desc, (content) => msg.reply(content));
+        return await finishCreate(session, desc, (content) => msg.reply(content));
       }
       return; // 防禦性，理論上不會走到（session.step 只會是上述三值之一）
     }
@@ -1065,7 +1394,7 @@ client.on('messageCreate', async (msg) => {
     // 已過期的不吃這則訊息，清掉後照新的輸入往下走。
     const flow = aiFlows.get(msg.author.id);
     if (flow && Date.now() > flow.expiresAt) aiFlows.delete(msg.author.id);
-    else if (flow) return handleAiFlowMessage(msg, flow);
+    else if (flow) return await handleAiFlowMessage(msg, flow);
 
     // 已有一輪 AI 呼叫在跑，還沒回來——不要再開一輪，避免重複呼叫 claude -p。
     if (aiInFlight.has(msg.author.id)) {
@@ -1074,13 +1403,13 @@ client.on('messageCreate', async (msg) => {
 
     // 「查」「刪」只在沒有任何進行中流程時才攔截，避免吃掉其他狀態的輸入。
     const queryMatch = text.match(/^查\s+(.+)$/);
-    if (queryMatch) return handleQuery(msg, queryMatch[1].trim());
+    if (queryMatch) return await handleQuery(msg, queryMatch[1].trim());
 
     const delMatch = text.match(/^刪\s+(.+)$/);
-    if (delMatch) return handleDelete(msg, delMatch[1].trim());
+    if (delMatch) return await handleDelete(msg, delMatch[1].trim());
 
     // 預設路徑：非指令訊息一律走 AI 解析（BOT-AI-INTAKE-SPEC.md）。
-    return startAiParse(msg, text);
+    return await startAiParse(msg, text);
   } catch (err) {
     console.error('[bot] messageCreate error:', err);
     clearAiState(msg.author.id, { keepCards: true });
@@ -1095,9 +1424,9 @@ client.on('interactionCreate', async (interaction) => {
     // E3 候選卡（BOT-E3-INTAKE-SPEC.md）：卡片在 #e3-bot，只檢查 ALLOWED_USER_ID、不套 ALLOWED_CHANNEL_ID
     if (isE3Interaction(interaction)) {
       if (process.env.ALLOWED_USER_ID && interaction.user.id !== process.env.ALLOWED_USER_ID) {
-        return interaction.reply({ content: '這個 bot 只服務它的主人 🙂', ephemeral: true });
+        return await interaction.reply({ content: '這個 bot 只服務它的主人 🙂', ephemeral: true });
       }
-      return handleE3Interaction(interaction, {
+      return await handleE3Interaction(interaction, {
         createPlaneIssue,
         updatePlaneIssue,
         fetchAllIssues,
@@ -1115,17 +1444,20 @@ client.on('interactionCreate', async (interaction) => {
     const isDeleteNo = interaction.isButton() && interaction.customId === 'plane_del_no';
     const isAiOk = interaction.isButton() && interaction.customId.startsWith('plane_ai_ok:');
     const isAiNo = interaction.isButton() && interaction.customId.startsWith('plane_ai_no:');
-    if (!isLabelSelect && !isDeletePick && !isDeleteOk && !isDeleteNo && !isAiOk && !isAiNo) return;
+    const isUpdPick = interaction.isStringSelectMenu() && interaction.customId.startsWith('plane_upd_pick:');
+    const isUpdOk = interaction.isButton() && interaction.customId.startsWith('plane_upd_ok:');
+    const isUpdNo = interaction.isButton() && interaction.customId.startsWith('plane_upd_no:');
+    if (!isLabelSelect && !isDeletePick && !isDeleteOk && !isDeleteNo && !isAiOk && !isAiNo && !isUpdPick && !isUpdOk && !isUpdNo) return;
 
-    if (process.env.ALLOWED_CHANNEL_ID && interaction.channelId !== process.env.ALLOWED_CHANNEL_ID) return;
+    if (allowedChannelId() && interaction.channelId !== allowedChannelId()) return;
     if (process.env.ALLOWED_USER_ID && interaction.user.id !== process.env.ALLOWED_USER_ID) {
-      return interaction.reply({ content: '這個 bot 只服務它的主人 🙂', ephemeral: true });
+      return await interaction.reply({ content: '這個 bot 只服務它的主人 🙂', ephemeral: true });
     }
 
     if (isLabelSelect) {
       const session = sessions.get(interaction.user.id);
       if (!session || session.step !== 'label') {
-        return interaction.reply({ content: '這個選單已過期，請重新傳事件名稱給我。', ephemeral: true });
+        return await interaction.reply({ content: '這個選單已過期，請重新傳事件名稱給我。', ephemeral: true });
       }
 
       session.label = LABELS.find((l) => l.name === interaction.values[0]) || LABELS[LABELS.length - 1];
@@ -1138,16 +1470,20 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    if (isDeletePick) return handleDeletePick(interaction);
-    if (isDeleteOk) return handleDeleteConfirm(interaction);
-    if (isDeleteNo) return handleDeleteCancel(interaction);
-    if (isAiOk) return handleAiConfirmOk(interaction);
-    if (isAiNo) return handleAiConfirmNo(interaction);
+    if (isDeletePick) return await handleDeletePick(interaction);
+    if (isDeleteOk) return await handleDeleteConfirm(interaction);
+    if (isDeleteNo) return await handleDeleteCancel(interaction);
+    if (isAiOk) return await handleAiConfirmOk(interaction);
+    if (isAiNo) return await handleAiConfirmNo(interaction);
+    if (isUpdPick) return await handleUpdatePick(interaction);
+    if (isUpdOk) return await handleUpdateConfirm(interaction);
+    if (isUpdNo) return await handleUpdateCancel(interaction);
   } catch (err) {
     console.error('[bot] interactionCreate error:', err);
     sessions.delete(interaction.user.id);
     pendingDeletes.delete(interaction.user.id);
     pendingDeleteLists.delete(interaction.user.id);
+    clearPendingUpdatesFor(interaction.user.id);
     aiFlows.delete(interaction.user.id);
     try {
       await interaction.followUp({ content: `❌ 出錯了：${err.message}`, ephemeral: true });
@@ -1189,6 +1525,9 @@ module.exports = {
   mdPadded,
   byTargetDateAsc,
   buildListMessage,
+  fetchPlaneStates, // 唯讀：digest 預覽腳本用
+  digestRunner, // 測試用
+  allowedChannelId, // 測試用
   fetchAllIssues, // 唯讀；日後測試/驗收可直接用真實 API 跑分頁與過濾邏輯
   handleQuery,
   handleDelete,
@@ -1222,6 +1561,18 @@ module.exports = {
   dispatchByIntent,
   handleAiOutcome,
   // ↓ E3 候選卡（BOT-E3-INTAKE-SPEC.md）：e3-intake.js 的 deps 與 selftest-e3-intake.js 用
+  // ↓ BOT-SMART-SPEC.md v4（改期／時間地點／查重）
+  smartHooks, // 測試用：注入假的 fetchAll／wait，selftest 不連網
+  pendingUpdates,
+  clearPendingUpdatesFor,
+  aiUnusableHelpText,
+  patchPlaneIssue,
+  runAiUpdate,
+  handleUpdatePick,
+  handleUpdateConfirm,
+  handleUpdateCancel,
+  buildUpdateConfirmPayload,
+  finishCreate,
   updatePlaneIssue, // 測試用：PATCH target_date，真實 API 只在端到端驗收時才碰
   LABELS,
   fmt,

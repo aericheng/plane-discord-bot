@@ -6,7 +6,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "selftest": "node selftest-split.js && node selftest-e3-intake.js && node selftest-ai-flow.js && node selftest-create-recovery.js"
+    "selftest": "node selftest-split.js && node selftest-e3-intake.js && node selftest-ai-flow.js && node selftest-create-recovery.js && node selftest-smart.js && node selftest-digest.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",

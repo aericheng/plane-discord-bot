@@ -9,6 +9,7 @@
 
 const fs = require('node:fs');
 const { spawn, execSync } = require('node:child_process');
+const { normalizeTimeText, normalizeLocationText } = require('./smart-edit');
 
 // 存活中的 claude 子行程 PID，供 bot.js 在關機時收割，避免殭屍行程（learning bot 2026-07-09 實案教訓）。
 const activePids = new Set();
@@ -437,7 +438,7 @@ function extractJson(resultText, requiredKey) {
 
 // ===== 解析契約（BOT-AI-INTAKE-SPEC.md §解析契約，v3 起見 BOT-AI-INTENT-SPEC.md） =====
 const AI_LABEL_NAMES = ['test', 'homework', 'presentation', 'remind', 'competition'];
-const AI_INTENTS = ['create', 'query', 'delete', 'unknown'];
+const AI_INTENTS = ['create', 'query', 'delete', 'update', 'unknown'];
 
 // 今天日期＋星期，Asia/Taipei 時區意識（不依賴機器本身的系統時區設定）。
 function taipeiTodayInfo() {
@@ -479,17 +480,33 @@ function buildParsePrompt({ userText, clarify }) {
     '- remind：一般提醒 💡',
     '- competition：比賽 🏆',
     '',
-    '意圖分類（intent，四選一）：',
+    '意圖分類（intent，五選一）：',
     '- create：使用者在描述一件未來要做/要交/要考的具體事，例如「8/12有微積分考試」「記得買生日禮物」→ 用 events 抽出來，query 三個欄位都填 null。',
     '- query：使用者要問/看某個日期或關鍵字底下有哪些既有行程，例如「告訴我8/1有哪些行程」「8月有沒有作業」→ 用 query 物件描述查詢條件，events 給空陣列。',
     '- delete：使用者要刪除/取消某個日期或關鍵字對應的既有行程，例如「幫我刪掉8/1的古」→ 用 query 物件描述要刪除的目標，events 給空陣列。',
+    '- update：使用者要改某筆既有行程的日期（改期）、名稱、時間或地點，例如「今天的桌球考試改到下禮拜同個時間」「老人驗改到 B03」→ query 描述「要改哪一筆」（規則同 delete），changes 描述要改成什麼，events 給空陣列。',
     '- unknown：看不出是上述哪一種（純聊天、打招呼、內容太模糊），query 與 events 都留空。',
     '',
-    'query 物件的填法（intent 是 query 或 delete 時才要填；create/unknown 時三個欄位都填 null）：',
+    'query 物件的填法（intent 是 query、delete 或 update 時才要填；create/unknown 時三個欄位都填 null）：',
     '- keyword 只填事件名稱裡真正代表內容的關鍵詞（例如「古」「作業」），不要把整句話塞進去；只有日期沒有關鍵字就把 keyword 填 null。',
     '- 只有關鍵字沒有日期，start 跟 end 都填 null。',
     '- 只有單一天，start 跟 end 填同一個日期；一段範圍才分別填首尾日期。',
-    '- 日期跟關鍵字都看不出來（真的無法判斷要查/刪什麼）→ 在 questions 提出來問清楚，不要瞎猜。',
+    '- 日期跟關鍵字都看不出來（真的無法判斷要查/刪/改什麼）→ 在 questions 提出來問清楚，不要瞎猜。',
+    '',
+    'changes 物件的填法（只有 intent=update 才要填，其他 intent 五個欄位都填 null）：',
+    '- due：使用者給「絕對日期」（例如「改到 11/5」）時才填，格式 YYYY-MM-DD。',
+    '- shift_days：使用者說「相對於原事件」的改法時填整數天數：「下禮拜同個時間」「延一週」＝7、「往後兩天」＝2、「提前一天」＝-1。你不知道原事件的日期，所以這種情況絕對不要自己算 due。',
+    '- due 與 shift_days 只能擇一，不能兩個都填；沒有要改日期兩個都填 null。',
+    '- name：要改成的新名稱（不用加 emoji）；沒要改名填 null。',
+    '- time：要改成的新時間，格式 "HH:MM" 或 "HH:MM~HH:MM"（24 小時制）；沒要改填 null。',
+    '- location：要改成的新地點；沒要改填 null。',
+    '- changes 至少要有一項非 null；使用者沒講清楚要改什麼 → 在 questions 問，不要瞎猜。',
+    '- query 描述的是「原本那筆」的日期／關鍵字，不是改完以後的日期。',
+    '',
+    'events 裡每筆事件的 time / location（intent=create）：',
+    '- time：原文提到的時間，格式 "HH:MM" 或 "HH:MM~HH:MM"（24 小時制，下午 7 點 10 分 → "19:10"）；沒提到填 null，不准猜。',
+    '- location：原文提到的地點或教室（例如 "B02"）；沒提到填 null，不准猜。',
+    '- desc：只放時間地點以外、對行程有用的資訊（例如攜帶物品、報名連結）；沒有就填空字串。時間和地點不要重複寫進 desc。',
     '',
     '使用者原文：',
     '"""',
@@ -514,16 +531,20 @@ function buildParsePrompt({ userText, clarify }) {
   lines.push(
     '',
     '範例（few-shot，格式必須完全照這樣輸出一個 JSON 物件，不要有多餘文字）：',
-    '- 原文「8/12有微積分考試」→ {"intent":"create","query":{"start":null,"end":null,"keyword":null},"events":[{"name":"微積分考試","due":"2026-08-12","label":"test","desc":""}],"questions":[]}',
-    '- 原文「告訴我8/1有哪些行程」→ {"intent":"query","query":{"start":"2026-08-01","end":"2026-08-01","keyword":null},"events":[],"questions":[]}',
-    '- 原文「幫我刪掉8/1的古」→ {"intent":"delete","query":{"start":"2026-08-01","end":"2026-08-01","keyword":"古"},"events":[],"questions":[]}',
+    '- 原文「8/12有微積分考試」→ {"intent":"create","query":{"start":null,"end":null,"keyword":null},"changes":{"due":null,"shift_days":null,"name":null,"time":null,"location":null},"events":[{"name":"微積分考試","due":"2026-08-12","label":"test","desc":"","time":null,"location":null}],"questions":[]}',
+    '- 原文「11/4（三）是假日營的老人驗 19:10 B02」→ {"intent":"create","query":{"start":null,"end":null,"keyword":null},"changes":{"due":null,"shift_days":null,"name":null,"time":null,"location":null},"events":[{"name":"假日營的老人驗","due":"2026-11-04","label":"test","desc":"","time":"19:10","location":"B02"}],"questions":[]}',
+    '- 原文「告訴我8/1有哪些行程」→ {"intent":"query","query":{"start":"2026-08-01","end":"2026-08-01","keyword":null},"changes":{"due":null,"shift_days":null,"name":null,"time":null,"location":null},"events":[],"questions":[]}',
+    '- 原文「幫我刪掉8/1的古」→ {"intent":"delete","query":{"start":"2026-08-01","end":"2026-08-01","keyword":"古"},"changes":{"due":null,"shift_days":null,"name":null,"time":null,"location":null},"events":[],"questions":[]}',
+    `- 原文「今天的桌球考試改到下禮拜同個時間」→ {"intent":"update","query":{"start":"${iso}","end":"${iso}","keyword":"桌球"},"changes":{"due":null,"shift_days":7,"name":null,"time":null,"location":null},"events":[],"questions":[]}`,
+    '- 原文「老人驗改到 B03」→ {"intent":"update","query":{"start":null,"end":null,"keyword":"老人驗"},"changes":{"due":null,"shift_days":null,"name":null,"time":null,"location":"B03"},"events":[],"questions":[]}',
     '',
     '請依上述規則抽取（可能有多筆事件，也可能一筆都沒有）。只輸出 JSON，不要有 markdown fence、不要有任何說明文字或前後贅字，格式如下：',
     '{',
-    '  "intent": "create" 或 "query" 或 "delete" 或 "unknown",',
+    '  "intent": "create" 或 "query" 或 "delete" 或 "update" 或 "unknown",',
     '  "query": { "start": "YYYY-MM-DD 或 null", "end": "YYYY-MM-DD 或 null", "keyword": "關鍵字或 null" },',
+    '  "changes": { "due": "YYYY-MM-DD 或 null", "shift_days": 整數或 null, "name": "新名稱或 null", "time": "HH:MM 或 HH:MM~HH:MM 或 null", "location": "新地點或 null" },',
     '  "events": [',
-    '    { "name": "事件名稱", "due": "YYYY-MM-DD 或 null", "label": "test/homework/presentation/remind/competition 之一或 null", "desc": "" }',
+    '    { "name": "事件名稱", "due": "YYYY-MM-DD 或 null", "label": "test/homework/presentation/remind/competition 之一或 null", "desc": "", "time": "HH:MM 或 HH:MM~HH:MM 或 null", "location": "地點或 null" }',
     '  ],',
     '  "questions": ["需要使用者澄清的問題，沒有就給空陣列"]',
     '}',
@@ -557,6 +578,29 @@ function normalizeAiQuery(rawQuery) {
 // bot 端決定性驗證（不信任 AI 輸出）：due 必為合法 YYYY-MM-DD 或 null；label 必為五個 key 之一或 null；
 // 沒有名稱的事件視為抽取失敗直接捨棄。intent 必為 enum 之一，非法值一律降級為 unknown（BOT-AI-INTENT-SPEC.md）。
 // intent=query/delete 卻連 keyword 與日期都沒有 → 這是 AI 抽取失敗，轉成一個 clarify 問題問使用者，不猜。
+// changes 物件（intent=update，BOT-SMART-SPEC.md §A）的決定性驗證。
+// due 與 shift_days 擇一（兩者都給視為 AI 錯誤）；至少要有一項變更。回傳 { changes, questions }。
+function normalizeAiChanges(raw) {
+  const due = isValidIsoDate(raw?.due) ? raw.due : null;
+  const sd = typeof raw?.shift_days === 'string' && /^-?\d+$/.test(raw.shift_days.trim()) ? Number(raw.shift_days) : raw?.shift_days;
+  const shift_days = Number.isInteger(sd) && sd !== 0 && Math.abs(sd) <= 366 ? sd : null;
+  const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim() : null;
+  const time = normalizeTimeText(raw?.time);
+  const location = normalizeLocationText(raw?.location);
+  const questions = [];
+  // 衝突時把衝突欄位清掉（不讓 due＋shift_days 帶進下游繞過驗證），其餘欄位保留。
+  let finalDue = due;
+  let finalShift = shift_days;
+  if (due && shift_days) {
+    finalDue = null;
+    finalShift = null;
+    questions.push('你是要改到某個確定的日期，還是相對原本日期往後／往前幾天？');
+  } else if (!due && !shift_days && !name && !time && !location) {
+    questions.push('要把這筆改成什麼？（新日期、新時間、新地點或新名稱）');
+  }
+  return { changes: { due: finalDue, shift_days: finalShift, name, time, location }, questions };
+}
+
 function normalizeAiResult(json) {
   const rawEvents = Array.isArray(json?.events) ? json.events : [];
   const questions = Array.isArray(json?.questions)
@@ -568,6 +612,8 @@ function normalizeAiResult(json) {
       due: isValidIsoDate(e?.due) ? e.due : null,
       label: AI_LABEL_NAMES.includes(e?.label) ? e.label : null,
       desc: typeof e?.desc === 'string' ? e.desc : '',
+      time: normalizeTimeText(e?.time),
+      location: normalizeLocationText(e?.location),
     }))
     .filter((e) => e.name);
 
@@ -578,7 +624,15 @@ function normalizeAiResult(json) {
     finalQuestions.push(intent === 'delete' ? '要刪除的是哪一天，或關鍵字是什麼？' : '要查詢的是哪一天，或關鍵字是什麼？');
   }
 
-  return { intent, query, events, questions: finalQuestions };
+  let changes = { due: null, shift_days: null, name: null, time: null, location: null };
+  if (intent === 'update') {
+    if (!query.start && !query.end && !query.keyword) finalQuestions.push('要改的是哪一天的事件，或關鍵字是什麼？');
+    const c = normalizeAiChanges(json?.changes);
+    changes = c.changes;
+    finalQuestions.push(...c.questions);
+  }
+
+  return { intent, query, changes, events, questions: finalQuestions };
 }
 
 /**
@@ -587,7 +641,7 @@ function normalizeAiResult(json) {
  * @param {string} opts.userText
  * @param {{questions:string[], answer:string, intent?:string}} [opts.clarify] - intent 是上一輪判斷的意圖，
  *   帶進 prompt context 避免澄清後意圖漂移（BOT-AI-INTENT-SPEC.md §管線接軌）。
- * @returns {Promise<{ok:true, intent:string, query:object, events:object[], questions:string[]} | {ok:false, error:string, errorCode:string}>}
+ * @returns {Promise<{ok:true, intent:string, query:object, changes:object, events:object[], questions:string[]} | {ok:false, error:string, errorCode:string}>}
  */
 async function runAiParse({ userText, clarify }) {
   const prompt = buildParsePrompt({ userText, clarify });
@@ -610,10 +664,11 @@ async function runAiParse({ userText, clarify }) {
   }
 
   const normalized = normalizeAiResult(json);
-  return { ok: true, intent: normalized.intent, query: normalized.query, events: normalized.events, questions: normalized.questions };
+  return { ok: true, intent: normalized.intent, query: normalized.query, changes: normalized.changes, events: normalized.events, questions: normalized.questions };
 }
 
 module.exports = {
+  normalizeAiChanges,
   runAiParse,
   runClaude,
   estimateCostUsd,
