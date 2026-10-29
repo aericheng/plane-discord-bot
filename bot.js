@@ -4,6 +4,7 @@
 // label 對應的表情符號會加在事件名稱前（test 💯 / homework 📚 / presentation 🗣️ / remind 💡 / competition 🏆）。
 // 建好的事件會出現在 Plane，並由既有的 Apps Script 每小時同步進 Google 日曆。
 
+const logger = require('./log');
 require('dotenv').config();
 const { installSplitting, installLogRedaction } = require('./discord-util');
 installLogRedaction();
@@ -26,10 +27,10 @@ const digest = require('./digest');
 
 // 全域錯誤 handler：單一 promise 失敗只記 log；同步例外記 log 後以 exit 1 結束交給 start-bot.cmd 重啟
 process.on('unhandledRejection', (reason) => {
-  console.error('[bot] unhandledRejection:', reason && reason.stack ? reason.stack : reason);
+  logger.error('[bot] unhandledRejection:', reason && reason.stack ? reason.stack : reason);
 });
 process.on('uncaughtException', (err) => {
-  console.error('[bot] uncaughtException:', err && err.stack ? err.stack : err);
+  logger.error('[bot] uncaughtException:', err && err.stack ? err.stack : err);
   try { killActiveClaudeChildren(); } catch (_) {}
   process.exitCode = 1;
   setTimeout(() => process.exit(1), 2000).unref();
@@ -353,7 +354,7 @@ async function postPlaneIssue({ name, due, label, desc }) {
 const RECOVERY_WAITS_MS = [3000, 10000];
 const CREATED_AT_SLACK_MS = 2 * 60 * 1000; // 本機與 Plane 伺服器時鐘誤差的容忍
 // excludeIds：同一批已建立的 id（同批有同名同日時，避免把前一筆誤認成這一筆）。
-async function createWithRecovery(payload, { post, fetchAll, wait = sleep, now = Date.now, log = console.log, excludeIds = new Set() }) {
+async function createWithRecovery(payload, { post, fetchAll, wait = sleep, now = Date.now, log = logger.log, excludeIds = new Set() }) {
   const startedAt = now();
   try {
     return await post(payload);
@@ -432,7 +433,7 @@ async function loadDupCheckList() {
   try {
     return { issues: await smartHooks.fetchAll() };
   } catch (err) {
-    console.error('[bot] dup-check list failed:', err.message);
+    logger.error('[bot] dup-check list failed:', err.message);
     return { issues: null };
   }
 }
@@ -786,7 +787,7 @@ async function startAiParse(msg, text) {
   if (aiGeneration.get(userId) !== myGen) return; // 已被取消或有新一輪蓋過，捨棄這次結果
 
   if (!result.ok) {
-    console.error('[bot] AI 解析失敗:', result.error);
+    logger.error('[bot] AI 解析失敗:', result.error);
     return placeholder.edit(aiFallbackContent(userId, text));
   }
   return handleAiOutcome(placeholder, msg, userId, result, text);
@@ -808,7 +809,7 @@ async function handleClarifyAnswer(msg, flow) {
   if (aiGeneration.get(userId) !== myGen) return;
 
   if (!result.ok) {
-    console.error('[bot] AI 澄清解析失敗:', result.error);
+    logger.error('[bot] AI 澄清解析失敗:', result.error);
     return placeholder.edit(aiFallbackContent(userId, flow.originalText));
   }
   return dispatchByIntent(placeholder, msg, userId, result, flow.originalText);
@@ -857,7 +858,7 @@ async function handleAiConfirmOk(interaction) {
 async function withButtonLock(interaction, fn) {
   const key = interaction.message && interaction.message.id;
   if (key && buttonInFlight.has(key)) {
-    console.log(`[bot] duplicate button interaction ignored (message ${key})`);
+    logger.log(`[bot] duplicate button interaction ignored (message ${key})`);
     return interaction.reply({ content: '⏳ 這張卡正在處理中，請勿重複按。', ephemeral: true });
   }
   if (key) buttonInFlight.add(key);
@@ -933,7 +934,7 @@ async function buildQueryReplyContent(q) {
     const header = `📋 ${headerLabel} 共 ${matched.length} 筆：`;
     return buildListMessage(header, lines);
   } catch (err) {
-    console.error('[bot] handleQuery error:', err);
+    logger.error('[bot] handleQuery error:', err);
     return `❌ 查詢失敗：${err.message}`;
   }
 }
@@ -1029,7 +1030,7 @@ async function runAiUpdate(placeholder, originalMsg, normalized) {
     }
     return presentUpdateChoices(originalMsg, matched, normalized.changes);
   } catch (err) {
-    console.error('[bot] runAiUpdate error:', err);
+    logger.error('[bot] runAiUpdate error:', err);
     return placeholder.edit(`❌ 修改流程出錯：${err.message}`);
   }
 }
@@ -1178,7 +1179,7 @@ async function handleDelete(msg, argText) {
     }
     return presentDeleteChoices(msg, matched);
   } catch (err) {
-    console.error('[bot] handleDelete error:', err);
+    logger.error('[bot] handleDelete error:', err);
     return msg.reply(`❌ 刪除流程出錯：${err.message}`);
   }
 }
@@ -1206,7 +1207,7 @@ async function runAiDelete(placeholder, originalMsg, aiQuery) {
     if (matched.length === 1) return presentDeleteConfirm(originalMsg, matched[0]);
     return presentDeleteChoices(originalMsg, matched);
   } catch (err) {
-    console.error('[bot] handleDelete error:', err);
+    logger.error('[bot] handleDelete error:', err);
     return placeholder.edit(`❌ 刪除流程出錯：${err.message}`);
   }
 }
@@ -1299,10 +1300,10 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-client.on('error', (err) => console.error('[bot] discord client error:', err && err.stack ? err.stack : err));
-client.on('shardDisconnect', (ev, id) => console.warn(`[bot] shard ${id} disconnected code=${ev && ev.code}`));
-client.on('shardResume', (id) => console.log(`[bot] shard ${id} resumed`));
-client.on('warn', (m) => console.warn('[bot] discord warn:', m));
+client.on('error', (err) => logger.error('[bot] discord client error:', err && err.stack ? err.stack : err));
+client.on('shardDisconnect', (ev, id) => logger.warn(`[bot] shard ${id} disconnected code=${ev && ev.code}`));
+client.on('shardResume', (id) => logger.debug(`[bot] shard ${id} resumed`)); // 噪音：只在 BOT_DEBUG=1 才印
+client.on('warn', (m) => logger.warn('[bot] discord warn:', m));
 
 // 只有空白視為沒設。
 function allowedChannelId() {
@@ -1314,6 +1315,7 @@ const digestRunner = digest.createDigestRunner({
   fetchAll: () => smartHooks.fetchAll(),
   fetchStates: fetchPlaneStates,
   priorityLabelIds: LABELS.filter((l) => l.name === 'test' || l.name === 'homework').map((l) => l.id),
+  eveningLabelIds: LABELS.filter((l) => l.name === 'presentation').map((l) => l.id),
   send: async (text) => {
     const channel = await client.channels.fetch(allowedChannelId());
     await digest.sendToChannel(channel, text);
@@ -1321,12 +1323,12 @@ const digestRunner = digest.createDigestRunner({
 });
 
 client.on('clientReady', () => {
-  console.log(`[bot] logged in as ${client.user.tag} at ${new Date().toISOString()}`);
+  logger.log(`[bot] logged in as ${client.user.tag} at ${new Date().toISOString()}`);
   if (!allowedChannelId()) {
-    console.warn('[bot] digest disabled: ALLOWED_CHANNEL_ID not set');
+    logger.warn('[bot] digest disabled: ALLOWED_CHANNEL_ID not set');
     return;
   }
-  digestRunner.start().catch((err) => console.error('[bot] digest start failed:', err && err.stack ? err.stack : err));
+  digestRunner.start().catch((err) => logger.error('[bot] digest start failed:', err && err.stack ? err.stack : err));
 });
 
 client.on('messageCreate', async (msg) => {
@@ -1411,7 +1413,7 @@ client.on('messageCreate', async (msg) => {
     // 預設路徑：非指令訊息一律走 AI 解析（BOT-AI-INTAKE-SPEC.md）。
     return await startAiParse(msg, text);
   } catch (err) {
-    console.error('[bot] messageCreate error:', err);
+    logger.error('[bot] messageCreate error:', err);
     clearAiState(msg.author.id, { keepCards: true });
     try {
       await msg.reply(`❌ 建立失敗：${err.message}\n請重新傳一次再試。`);
@@ -1434,7 +1436,7 @@ client.on('interactionCreate', async (interaction) => {
         parseSingleDate,
         fmt,
         issueUrl,
-        log: console.log,
+        log: logger.log,
       });
     }
 
@@ -1479,7 +1481,7 @@ client.on('interactionCreate', async (interaction) => {
     if (isUpdOk) return await handleUpdateConfirm(interaction);
     if (isUpdNo) return await handleUpdateCancel(interaction);
   } catch (err) {
-    console.error('[bot] interactionCreate error:', err);
+    logger.error('[bot] interactionCreate error:', err);
     sessions.delete(interaction.user.id);
     pendingDeletes.delete(interaction.user.id);
     pendingDeleteLists.delete(interaction.user.id);
@@ -1495,15 +1497,15 @@ client.on('interactionCreate', async (interaction) => {
 // 讓下面純函式（日期解析、查詢過濾、訊息組字）可以被單獨測試。
 if (require.main === module) {
   if (!process.env.DISCORD_TOKEN || process.env.DISCORD_TOKEN === 'PUT_YOUR_DISCORD_BOT_TOKEN_HERE') {
-    console.error('[bot] DISCORD_TOKEN not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — get one from https://discord.com/developers/applications');
+    logger.error('[bot] DISCORD_TOKEN not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — get one from https://discord.com/developers/applications');
     process.exit(2);
   }
   if (!process.env.ALLOWED_USER_ID || !process.env.ALLOWED_USER_ID.trim()) {
-    console.error('[bot] ALLOWED_USER_ID not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — set ALLOWED_USER_ID=<your Discord user id>');
+    logger.error('[bot] ALLOWED_USER_ID not set in .env (exit 2 = config error, start-bot.cmd will NOT restart) — set ALLOWED_USER_ID=<your Discord user id>');
     process.exit(2);
   }
   client.login(process.env.DISCORD_TOKEN).catch((err) => {
-    console.error('[bot] login failed:', err && err.message ? err.message : err);
+    logger.error('[bot] login failed:', err && err.message ? err.message : err);
     process.exit(err && err.code === 'TokenInvalid' ? 2 : 1);
   });
 

@@ -7,6 +7,7 @@
 // 不連 Discord、不打 Plane 就能回歸；只有 handleE3Interaction 會碰 interaction 與 deps 裡的 Plane API。
 // 所有結果宣稱只憑 API 回應（issue.name／target_date／id），不憑送出值。
 
+const logger = require('./log');
 const {
   ActionRowBuilder,
   EmbedBuilder,
@@ -225,7 +226,7 @@ async function handleE3Interaction(interaction, deps) {
   if (interaction.isButton() && interaction.customId === E3_BUTTON_EDIT) return handleE3InteractionInner(interaction, deps);
   const key = interaction.message && interaction.message.id;
   if (key && inFlight.has(key)) {
-    (deps.log || console.log)(`[bot] e3 duplicate interaction ignored (message ${key})`);
+    (deps.log || logger.log)(`[bot] e3 duplicate interaction ignored (message ${key})`);
     await interaction.deferUpdate();
     return interaction.followUp({ content: '⏳ 這張卡正在處理中，請勿重複按。', ephemeral: true });
   }
@@ -241,7 +242,7 @@ async function handleE3Interaction(interaction, deps) {
 // 按鈕先 deferUpdate；✏️ 例外——showModal 必須是第一個回應。modal submit 用 isFromMessage 確認後 deferUpdate，
 // 原卡片用 interaction.message。成功／略過 → 改卡片並拿掉按鈕；同名多筆或 API 失敗 → 按鈕保留、followUp ephemeral。
 async function handleE3InteractionInner(interaction, deps) {
-  const { LABELS, log = console.log } = deps;
+  const { LABELS, log = logger.log } = deps;
 
   if (interaction.isButton()) {
     const embed = interaction.message && interaction.message.embeds && interaction.message.embeds[0];
@@ -298,7 +299,7 @@ async function handleE3InteractionInner(interaction, deps) {
 
 // 建立／更新／去重的共同流程（✅ 與 ✏️ submit 都走這裡）。edited=true 時把卡片欄位改成使用者修改後的值。
 async function applyCandidate(interaction, embed, { name, dueDate, label, desc }, deps, edited) {
-  const { createPlaneIssue, updatePlaneIssue, fetchAllIssues, issueUrl, log = console.log } = deps;
+  const { createPlaneIssue, updatePlaneIssue, fetchAllIssues, issueUrl, log = logger.log } = deps;
   const finalName = label.emoji ? `${label.emoji} ${name}` : name;
   const edits = edited ? { name, dueDate, labelName: label.name, desc } : { labelName: label.name };
 

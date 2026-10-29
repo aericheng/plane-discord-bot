@@ -1,5 +1,6 @@
 // BOT-SMART-SPEC.md v4（A 改期／修改、B 時間地點、C 建立前查重）的純邏輯：不連網、不碰 Discord。
 // bot.js 與 ai-intake.js 共用；selftest-smart.js 直接測這裡。
+const logger = require('./log');
 const { normalizeName } = require('./e3-intake'); // 查重重用 E3 的名稱正規化（不另寫一份）
 
 // ===== B. 時間／地點 =====
@@ -188,7 +189,7 @@ const PATCH_RECOVERY_WAITS_MS = [3000, 10000];
 
 // PATCH 逾時／連線中斷時比照 createWithRecovery：不直接報失敗，重抓列表確認欄位是否已是新值。
 // Plane 回 HTTP 錯誤碼（planeStatus）是明確失敗，照舊直接丟。
-async function patchWithRecovery({ issueId, patch, expected }, { send, fetchAll, wait, log = console.log }) {
+async function patchWithRecovery({ issueId, patch, expected }, { send, fetchAll, wait, log = logger.log }) {
   try {
     return { issue: await send(issueId, patch), recovered: false };
   } catch (err) {

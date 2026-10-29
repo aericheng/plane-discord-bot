@@ -7,6 +7,7 @@
 // 2. prompt 一律走 stdin，argv 只放旗標；空字串/含 ()&|<>^% 的旗標值要補引號。
 // 3. timeout 要先 taskkill /T 殺整棵樹（趁根行程還活著才走訪得到孫行程），10 秒保險絲防孤兒行程卡死 close。
 
+const logger = require('./log');
 const fs = require('node:fs');
 const { spawn, execSync } = require('node:child_process');
 const { normalizeTimeText, normalizeLocationText } = require('./smart-edit');
@@ -220,7 +221,7 @@ function writeApiCooldown(result, now = Date.now()) {
     fs.writeFileSync(tmp, JSON.stringify({ until: new Date(until).toISOString(), reason, status, project: API_COOLDOWN_PROJECT, set_at: new Date(now).toISOString() }));
     fs.renameSync(tmp, file);
   } catch (err) {
-    console.log(`[ai-intake] ${`API 冷卻檔寫入失敗（不影響主流程）：${err.message}`}`);
+    logger.log(`[ai-intake] ${`API 冷卻檔寫入失敗（不影響主流程）：${err.message}`}`);
     try { fs.unlinkSync(tmp); } catch { /* 暫存檔可能不存在 */ }
   }
   return until;
@@ -241,12 +242,12 @@ async function runClaude(opts) {
     const cd = readApiCooldown();
     const until = Math.max(apiDisabledUntil, cd.until);
     if (Date.now() < until) {
-      console.log(`[ai-intake] API 冷卻中: reason=${cd.reason ?? 'memory'} until=${new Date(until).toISOString()}，直接走訂閱`);
+      logger.log(`[ai-intake] API 冷卻中: reason=${cd.reason ?? 'memory'} until=${new Date(until).toISOString()}，直接走訂閱`);
     } else {
       const viaApi = await runClaudeOnce(opts, 'api');
       if (!isApiBillingError(viaApi)) return viaApi;
       apiDisabledUntil = writeApiCooldown(viaApi);
-      console.log(`[ai-intake] billing fallback: API 失敗（status=${viaApi.apiErrorStatus ?? '-'} ${String(viaApi.resultText || viaApi.error).trim().slice(0, 160)}），改走訂閱，API 暫停至 ${new Date(apiDisabledUntil).toISOString()}`);
+      logger.log(`[ai-intake] billing fallback: API 失敗（status=${viaApi.apiErrorStatus ?? '-'} ${String(viaApi.resultText || viaApi.error).trim().slice(0, 160)}），改走訂閱，API 暫停至 ${new Date(apiDisabledUntil).toISOString()}`);
     }
   }
   return runClaudeOnce(opts, 'subscription');

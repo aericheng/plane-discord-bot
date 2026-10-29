@@ -289,7 +289,7 @@ const todays = [mk('💯 桌球考試', TODAY, { group: 'unstarted', html: html(
   }
   // 週摘要：週日 21:00 的 tick 發送；週日 22:30 才醒也補發；週一 00:30 才醒不補、寫 log
   {
-    const c = makeRunner({ nowMs: tp('2026-11-01', 20, 0), issues: [mk('💯 週一考試', '2026-11-02', { group: 'unstarted' })], state: { dailyDate: '2026-11-01' } });
+    const c = makeRunner({ nowMs: tp('2026-11-01', 20, 0), issues: [mk('💯 週一考試', '2026-11-02', { group: 'unstarted' })], state: { dailyDate: '2026-11-01', eveningDate: '2026-11-01' } });
     await c.runner.start();
     eq(c.sent.length, 0, '週日 20:00 不發週摘要');
     c.now = tp('2026-11-01', 21, 0);
@@ -306,14 +306,14 @@ const todays = [mk('💯 桌球考試', TODAY, { group: 'unstarted', html: html(
   }
   {
     const wk = [mk('💯 週一考試', '2026-11-02', { group: 'unstarted' })];
-    const c = makeRunner({ nowMs: tp('2026-11-01', 20, 0), issues: wk, state: { dailyDate: '2026-11-01' } });
+    const c = makeRunner({ nowMs: tp('2026-11-01', 20, 0), issues: wk, state: { dailyDate: '2026-11-01', eveningDate: '2026-11-01' } });
     await c.runner.start();
     c.now = tp('2026-11-01', 22, 30); // 睡過 21:00，22:30 醒來
     await fireTick(c);
     eq(c.sent.length, 1, '週日 22:30 醒來 → 補發週摘要');
     ok(c.sent[0].includes('11/2（一） ~ 11/8（日）'), '補發的是正確的下一週（11/2~11/8）: ' + c.sent[0].split('\n')[0]);
 
-    const m = makeRunner({ nowMs: tp('2026-11-01', 20, 0), issues: [mk('x', '2026-11-09', { group: 'unstarted' }), ...wk], state: { dailyDate: '2026-11-01' } });
+    const m = makeRunner({ nowMs: tp('2026-11-01', 20, 0), issues: [mk('x', '2026-11-09', { group: 'unstarted' }), ...wk], state: { dailyDate: '2026-11-01', eveningDate: '2026-11-01' } });
     await m.runner.start();
     m.now = tp('2026-11-02', 0, 30); // 週一 00:30 才醒：窗已過
     await fireTick(m);

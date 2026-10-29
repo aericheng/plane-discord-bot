@@ -12,16 +12,28 @@
 //   列表 API 的每筆 issue 另帶 `state`（state id）與 `state_group`（該 state 的 group 字串），
 //   所以優先用 issue.state_group；沒有時才用 states 對照表（state id → group）。
 //   group 為 completed 或 cancelled 即排除；archived_at 有值、is_draft 的也排除。
+const logger = require('./log');
 const fs = require('node:fs');
 const path = require('node:path');
 const { splitMessage } = require('./discord-util');
-const { extractTimeLocation, shiftIsoDate, weekdayZh } = require('./smart-edit');
+const { extractTimeLocation, shiftIsoDate, weekdayZh, descHtmlToText } = require('./smart-edit');
 
 const TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
 const DAILY_AT = { hour: 7, minute: 30 };
 const WEEKLY_AT = { dow: 0, hour: 21, minute: 0 }; // 週日 21:00
 const CATCHUP_FROM_MIN = 7 * 60 + 30; // 07:30
 const CATCHUP_TO_MIN = 12 * 60; // 12:00（不含）
+// 前一晚提醒（evening pass）：每天 20:00（環境變數 EVENING_AT=HH:MM 可改）發「明天」的考試／報告類事件；重啟補發窗到 23:00（不含）。
+function parseEveningAt(v) {
+  const m = String(v || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (m && Number(m[1]) < 23 && Number(m[2]) < 60) return { hour: Number(m[1]), minute: Number(m[2]) };
+  return { hour: 20, minute: 0 };
+}
+const EVENING_AT = parseEveningAt(process.env.EVENING_AT);
+const EVENING_FROM_MIN = EVENING_AT.hour * 60 + EVENING_AT.minute;
+const EVENING_TO_MIN = 23 * 60;
+const BRING_RE = /攜帶|準備|要帶|須帶|需帶|可帶|請帶/;
+const EVENING_DESC_MAX = 200;
 const MAX_OVERDUE = 5;
 const DONE_GROUPS = new Set(['completed', 'cancelled']);
 const PRIORITY_EMOJI = ['💯', '📚'];
@@ -192,6 +204,42 @@ function buildWeeklyDigest({ issues, statesById, todayIso, priorityLabelIds }) {
   return { text: lines.join('\n'), items, empty: items === 0, week: monday };
 }
 
+// ===== 前一晚清單（明天的 💯／📚 事件，附描述中的攜帶／準備段落） =====
+// 判定「考試／報告類」＝isPriorityIssue（名稱以 💯／📚 開頭，或 label 為 test／homework），與每日摘要的置頂排序同一套。
+// 描述取法：扣掉 時間：／地點： 兩行（已另列）；有含「攜帶／準備／要帶…」的行就只列那些行，沒有就列整段前 200 字。
+function eveningNote(html) {
+  const lines = descHtmlToText(html)
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter((l) => l && !/^(時間|地點)[:：]/.test(l));
+  if (!lines.length) return '';
+  const hit = lines.filter((l) => BRING_RE.test(l));
+  const text = (hit.length ? hit : lines).join(' ／ ');
+  return text.length > EVENING_DESC_MAX ? text.slice(0, EVENING_DESC_MAX) + '…' : text;
+}
+
+// 前一晚另外納入 🗣️ presentation（報告）：名稱以 🗣️ 開頭，或 label 在 eveningLabelIds（含 presentation 的 id）。
+function isEveningIssue(issue, priorityLabelIds = [], eveningLabelIds = []) {
+  if (isPriorityIssue(issue, priorityLabelIds)) return true;
+  if (String(issue.name || '').trim().startsWith('🗣️')) return true;
+  const labels = Array.isArray(issue.labels) ? issue.labels : [];
+  return labels.some((l) => eveningLabelIds.includes(typeof l === 'object' && l ? l.id : l));
+}
+
+function buildEveningDigest({ issues, statesById, todayIso, priorityLabelIds, eveningLabelIds }) {
+  const tomorrowIso = shiftIsoDate(todayIso, 1);
+  const picked = issues
+    .filter((i) => isOpenIssue(i, statesById) && i.target_date === tomorrowIso && isEveningIssue(i, priorityLabelIds, eveningLabelIds))
+    .map((i) => ({ item: toItem(i, priorityLabelIds), note: eveningNote(i.description_html) }));
+  const sorted = sortDayItems(picked.map((p) => p.item)).map((it) => picked.find((p) => p.item === it));
+  const lines = [`🌙 **明日提醒　${dayLabel(tomorrowIso)}**`, ''];
+  for (const { item, note } of sorted) {
+    const when = [item.time, item.location].filter(Boolean).join(' ') || '（時間地點未填）';
+    lines.push(`• ${item.name}｜${when}｜${note || '（描述沒有內容）'}`);
+  }
+  return { text: lines.join('\n'), items: sorted.length, empty: sorted.length === 0, date: tomorrowIso };
+}
+
 // ===== 狀態檔（data/digest-state.json，已在 .gitignore） =====
 const STATE_FILE = path.join(__dirname, 'data', 'digest-state.json');
 
@@ -222,17 +270,18 @@ function createDigestRunner(deps) {
     now: () => Date.now(),
     readState: () => readStateFile(),
     writeState: (s) => writeStateFile(s),
-    log: (line) => console.log(line),
+    log: (line) => logger.log(line),
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: (h) => clearTimeout(h),
     fetchStates: async () => ({}),
     priorityLabelIds: [],
+    eveningLabelIds: [],
     ...deps,
   };
   const timers = new Set(); // tick 與重試計時器都追蹤，stop() 一次清掉
   let started = false;
-  const sentMem = { daily: null, weekly: null }; // 本 process 已發的期別（writeState 失敗時避免重發）
-  const handled = { daily: null, weekly: null }; // tick 已處理（已啟動／已判定錯過）的期別，同一期不再處理
+  const sentMem = { daily: null, weekly: null, evening: null }; // 本 process 已發的期別（writeState 失敗時避免重發）
+  const handled = { daily: null, weekly: null, evening: null }; // tick 已處理（已啟動／已判定錯過）的期別，同一期不再處理
 
   const nowIso = () => new Date(d.now()).toISOString();
 
@@ -269,7 +318,7 @@ function createDigestRunner(deps) {
     } catch (err) {
       if (!(err && err.partial)) throw err;
       recordSent(kind, key, field);
-      d.log(`[bot] digest ${kind} partially sent ${field === 'dailyDate' ? 'date' : 'week'}=${key} not retrying: ${err.message}`);
+      d.log(`[bot] digest ${kind} partially sent ${field === 'weeklyWeek' ? 'week' : 'date'}=${key} not retrying: ${err.message}`);
       return false;
     }
     recordSent(kind, key, field);
@@ -310,9 +359,23 @@ function createDigestRunner(deps) {
     return 'sent';
   }
 
+  async function runEvening() {
+    const todayIso = taipeiParts(d.now()).iso;
+    if (sentMem.evening === todayIso || (d.readState() || {}).eveningDate === todayIso) return 'already';
+    const { issues, statesById } = await load();
+    const r = buildEveningDigest({ issues, statesById, todayIso, priorityLabelIds: d.priorityLabelIds, eveningLabelIds: d.eveningLabelIds });
+    if (r.empty) {
+      d.log(`[bot] digest evening skipped reason=empty date=${todayIso} at=${nowIso()}`);
+      return 'skipped';
+    }
+    if (!(await sendOnce('evening', todayIso, 'eveningDate', r.text))) return 'partial';
+    d.log(`[bot] digest evening sent n=${r.items} date=${todayIso} at=${nowIso()}`);
+    return 'sent';
+  }
+
   // 失敗（Plane 逾時、Discord 暫時不通）就依 RETRY_DELAYS_MS 再試；用盡才放棄並寫 log。
   function runWithRetry(kind, attempt = 0) {
-    const fn = kind === 'weekly' ? runWeekly : runDaily;
+    const fn = kind === 'weekly' ? runWeekly : kind === 'evening' ? runEvening : runDaily;
     return fn().catch((err) => {
       d.log(`[bot] digest ${kind} failed attempt=${attempt + 1}: ${err && err.message ? err.message : err}`);
       if (attempt < RETRY_DELAYS_MS.length) {
@@ -337,6 +400,18 @@ function createDigestRunner(deps) {
           await runWithRetry('daily');
         } else {
           d.log(`[bot] digest daily missed date=${p.iso} reason=after-12:00`);
+        }
+      }
+      // 前一晚：EVENING_AT（預設 20:00）起到 23:00 前可發（含補發）；23:00 後才醒就不補。
+      if (handled.evening !== p.iso && p.minutesOfDay >= EVENING_FROM_MIN) {
+        handled.evening = p.iso;
+        if (state.eveningDate === p.iso || sentMem.evening === p.iso) {
+          // 今晚已發過
+        } else if (p.minutesOfDay < EVENING_TO_MIN) {
+          if (p.minutesOfDay - EVENING_FROM_MIN >= 2) d.log('[bot] digest evening catch-up');
+          await runWithRetry('evening');
+        } else {
+          d.log(`[bot] digest evening missed date=${p.iso} reason=after-23:00`);
         }
       }
       // 每週：週日 21:00 起可發（窗到週一 00:00 前）；週一才發現沒發就不補。
@@ -377,7 +452,7 @@ function createDigestRunner(deps) {
     started = false;
   }
 
-  return { start, stop, tick, runDaily, runWeekly };
+  return { start, stop, tick, runDaily, runWeekly, runEvening };
 }
 
 // 發到頻道：超過 2000 字依 discord-util.splitMessage 分段依序送；不解析 @mention（事件名稱可能含 @）。
@@ -405,6 +480,8 @@ module.exports = {
   isPriorityIssue,
   buildDailyDigest,
   buildWeeklyDigest,
+  buildEveningDigest,
+  EVENING_AT,
   nextWeekRange,
   readStateFile,
   writeStateFile,
