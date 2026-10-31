@@ -69,7 +69,7 @@ const HELP_TEXT = [
   '- 也能用自然語言改期或修改：「今天的桌球考試改到下禮拜同個時間」「老人驗改到 B03」「11/4 的老人驗改成 19:30」。會先列出「舊 → 新」讓你按確認，60 秒沒按會過期。',
   '- 建立事件時，句子裡的時間和地點會自動存進描述（`時間：19:10`、`地點：B02`），Google 日曆同步後會變成定時事件和地點欄位；確認卡會顯示 🕒 時間、📍 地點。',
   '- **每日／每週摘要**：我會自己在這個頻道貼行程。每天 07:30 貼今天＋明天（兩天都沒事就不貼），每週日 21:00 貼下週一到週日（按日期分組、標星期）；💯 考試、📚 作業排在當天最前面，另列最多 5 筆已過期但未完成的 💯／📚，已完成或已取消的不會出現。bot 在 07:30–12:00 之間重啟、而今天還沒貼過時會補貼一次（不會重複貼）。',
-  '- 建立前會先查重：同名同一天已經有的事件不會重複建立，確認卡也會先標示。',
+  '- 建立前會先查重：同名同一天已經有的事件不會重複建立，確認卡也會先標示；同一天有名稱相近但不同名的事件時，確認卡和建立回報會加 ⚠️ 提醒（不會擋你）。E3／Gmail 候選卡遇到這種情況則不會直接建立，改問你要「仍要建立」還是「略過」。',
   '- 確認卡 24 小時內按都有效（bot 重啟或打 `取消` 會讓它失效），擺著沒按也不影響你繼續丟新的文字。',
   '- 缺日期的事件，按確認後我會逐筆問你。文字看不出明確內容時，我可能會先反問一次澄清（最多一輪）。這兩種「等你回答」的狀態 10 分鐘沒回就作廢，之後的訊息當新的一則處理。',
   '- AI 暫時不可用時：短文字（40 字以內）會自動退回下面的「逐步模式」；長文字會請你稍後再試。',
@@ -326,10 +326,14 @@ function escapeHtml(t) {
     .replace(/"/g, '&quot;');
 }
 
-async function postPlaneIssue({ name, due, label, desc }) {
+async function postPlaneIssue({ name, due, label, desc, source }) {
   const body = { name, target_date: due };
   if (label && label.id) body.labels = [label.id];
-  if (desc) body.description_html = `<p>${escapeHtml(desc).replace(/\r?\n/g, '<br/>')}</p>`;
+  // source：候選卡 footer 的 candidateId（e3:…／gmail:…），寫在描述末尾一行，之後查重可精確比對同一來源
+  const parts = [];
+  if (desc) parts.push(`<p>${escapeHtml(desc).replace(/\r?\n/g, '<br/>')}</p>`);
+  if (source) parts.push(`<p>source: ${escapeHtml(String(source))}</p>`);
+  if (parts.length) body.description_html = parts.join('');
   const res = await fetch(
     `${PLANE.apiBase}/workspaces/${PLANE.workspace}/projects/${PLANE.project}/issues/`,
     {
@@ -535,12 +539,15 @@ async function finishCreate(session, desc, replyFn) {
   const dupList = await loadDupCheckList();
   const created = [];
   const skipped = [];
+  const similarNotes = [];
   for (const due of session.dates) {
     const dup = dupList.issues ? smart.findDuplicates(dupList.issues, { name: finalName, due }) : [];
     if (dup.length) {
       skipped.push({ due, id: dup[0].id });
       continue;
     }
+    const sim = dupList.issues ? smart.findSimilar(dupList.issues, { name: finalName, due }) : [];
+    if (sim.length) similarNotes.push(`⚠️ ${due} 同日有相似事件「${sim[0].issue.name}」（仍已建立，請確認是不是同一件事）`);
     const issue = await createPlaneIssue({ name: finalName, due, label, desc }, { excludeIds: new Set(created.map((c) => c.id)) });
     created.push({ due, id: issue.id, recovered: !!issue.recoveredAfterError });
     if (session.dates.length > 1) await sleep(400);
@@ -564,6 +571,7 @@ async function finishCreate(session, desc, replyFn) {
     }
     if (skipped.length > 0) lines.push(`⏭️ 已有、略過：${skipped.map((k) => k.due).join('、')}`);
   }
+  lines.push(...similarNotes);
   if (!dupList.issues) lines.push('⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');
   lines.push(`🏷️ label：${label.id ? label.name : '（無）'}`);
   if (desc && created.length > 0) lines.push(`📝 description：已寫入`);
@@ -615,7 +623,7 @@ function labelInfoFor(labelName) {
   return LABELS.find((l) => l.name === labelName) || LABELS.find((l) => l.name === 'remind');
 }
 
-function cardLineFor(ev, idx, todayIso, isDup = false, sameCard = false) {
+function cardLineFor(ev, idx, todayIso, isDup = false, sameCard = false, similarName = null) {
   const info = labelInfoFor(ev.label || 'remind');
   const labelSuffix = ev.label ? '' : '（預設）';
   let dueDisplay;
@@ -627,6 +635,7 @@ function cardLineFor(ev, idx, todayIso, isDup = false, sameCard = false) {
   if (tl) out.push(`   ${tl}`);
   if (isDup) out.push('   ⚠️ 已有同名同日（不會重複建立）');
   else if (sameCard) out.push('   ⚠️ 與上面同名同日（只會建立一筆）');
+  else if (similarName) out.push(`   ⚠️ 同日有相似事件「${similarName}」（確認後仍會建立）`);
   return out.join('\n');
 }
 
@@ -645,7 +654,8 @@ function buildConfirmCard(events, { existing = null, dupCheckFailed = false } = 
     const key = smart.dupKey(finalName, e.due);
     const sameCard = !!key && seenKeys.has(key);
     if (key) seenKeys.add(key);
-    return cardLineFor(e, i, todayIso, isDup, sameCard);
+    const sim = !isDup && existing ? smart.findSimilar(existing, { name: finalName, due: e.due }) : [];
+    return cardLineFor(e, i, todayIso, isDup, sameCard, sim.length ? sim[0].issue.name : null);
   });
   if (dupCheckFailed) lines.push('⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');
   const text = [header, ...lines].join('\n');
@@ -688,6 +698,7 @@ async function createAiEvents(events) {
       results.push({ ok: true, skipped: true, name: sameBatch.name, due: sameBatch.due, id: sameBatch.id });
       continue;
     }
+    const sim = dupList.issues ? smart.findSimilar(dupList.issues, { name: finalName, due: ev.due }) : [];
     try {
       const issue = await createPlaneIssue(
         { name: finalName, due: ev.due, label, desc: smart.buildDescText({ time: ev.time, location: ev.location, desc: ev.desc }) },
@@ -695,6 +706,7 @@ async function createAiEvents(events) {
       );
       // 成功回報一律取 POST 回應的欄位（不用 AI 事件物件），失敗回報才用送出值描述目標
       const res = { ok: true, name: issue.name, due: issue.target_date, id: issue.id, recovered: !!issue.recoveredAfterError };
+      if (sim.length) res.similarTo = sim[0].issue.name;
       results.push(res);
       if (key) createdByKey.set(key, res);
     } catch (err) {
@@ -715,6 +727,7 @@ function buildAiCreateReport(results) {
   for (const r of results) {
     if (r.skipped) lines.push(`- ⏭️ 已有：${r.name} — ${r.due}｜${issueUrl(r.id)}`);
     else lines.push(r.ok ? `- ${r.name} — ${r.due}｜${issueUrl(r.id)}${r.recovered ? '（Plane 回應逾時，重查確認已建立）' : ''}` : `- ❌ ${r.name} — ${r.due}｜失敗：${r.error}`);
+    if (r.ok && !r.skipped && r.similarTo) lines.push(`  ⚠️ 同日有相似事件「${r.similarTo}」，請確認是不是同一件事`);
   }
   if (failCount > 0) lines.push('', `⚠️ ${failCount} 筆失敗，請人工確認 Plane 上的實際狀態。`);
   if (results.dupCheckFailed) lines.push('', '⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');

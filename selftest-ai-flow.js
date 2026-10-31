@@ -184,6 +184,31 @@ async function run() {
     global.fetch = realFetch;
   }
 
+  // 14. 相似事件只警示、不擋：同日有名稱相近但不同名的既有事件 → 卡片警示，按確認仍建立一筆
+  const hooksFetch = bot.smartHooks.fetchAll;
+  const realFetch2 = global.fetch;
+  const similarStore = [{ id: 'sim-1', name: '📚 影像與視訊生成 Lab 4 Announcement', target_date: '2026-11-12' }];
+  let simPosts = 0;
+  bot.smartHooks.fetchAll = async () => similarStore.map((i) => ({ ...i }));
+  global.fetch = async (url, opts = {}) => {
+    if ((opts.method || 'GET') === 'POST') { simPosts++; const b = JSON.parse(opts.body); return { ok: true, status: 201, json: async () => ({ id: 'new-sim', name: b.name, target_date: b.target_date }) }; }
+    return { ok: true, status: 200, json: async () => ({ results: [], next_page_results: false }) };
+  };
+  try {
+    const simEvents = [
+      { name: '影像與視訊生成 Lab4-Flow Matching', due: '2026-11-12', label: 'homework', desc: '', time: null, location: null },
+      { name: '影像與視訊生成 Lab4-Flow Matching', due: '2026-11-19', label: 'homework', desc: '', time: null, location: null },
+    ];
+    const simCard = bot.buildConfirmCard(simEvents, { existing: similarStore, dupCheckFailed: false });
+    ok((simCard.text.match(/同日有相似事件「/g) || []).length === 1, '相似警示只標同日那一筆（不同日不標）');
+    const simRes = await bot.createAiEvents(simEvents);
+    ok(simPosts === 2 && simRes.every((r) => r.ok && !r.skipped), `相似事件不擋建立（POST ${simPosts} 次）`);
+    ok((bot.buildAiCreateReport(simRes).match(/同日有相似事件「/g) || []).length === 1, '回報只對同日那一筆提醒');
+  } finally {
+    bot.smartHooks.fetchAll = hooksFetch;
+    global.fetch = realFetch2;
+  }
+
   console.log(`selftest-ai-flow: ${n} checks passed`);
   process.exit(0);
 }

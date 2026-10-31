@@ -1,7 +1,7 @@
 // BOT-SMART-SPEC.md v4（A 改期／修改、B 時間地點、C 建立前查重）的純邏輯：不連網、不碰 Discord。
 // bot.js 與 ai-intake.js 共用；selftest-smart.js 直接測這裡。
 const logger = require('./log');
-const { normalizeName } = require('./e3-intake'); // 查重重用 E3 的名稱正規化（不另寫一份）
+const { normalizeName, findSimilarIssues } = require('./e3-intake'); // 查重重用 E3 的名稱正規化與相似判定（不另寫一份）
 
 // ===== B. 時間／地點 =====
 const TIME_RE = /^(\d{1,2})[:：](\d{2})$/;
@@ -224,6 +224,12 @@ function findDuplicates(issues, { name, due }) {
   return (issues || []).filter((i) => i && i.target_date === due && normalizeName(i.name) === key);
 }
 
+// 自然語言建卡用：同日「名稱相近但不同名」的既有事件（只警示、不擋）。同名由 findDuplicates 處理。
+// 回傳 [{ issue, reason }]，reason 目前只會是 'similar-name'。
+function findSimilar(issues, { name, due }) {
+  return findSimilarIssues(issues, { name, due }).filter((x) => x.reason === 'similar-name');
+}
+
 // 同一批內互相查重用的 key：名稱正規化＋日期；沒有日期回 null（不比對）。
 function dupKey(name, due) {
   return due ? `${normalizeName(name)}|${due}` : null;
@@ -246,4 +252,5 @@ module.exports = {
   verifyIssueFields,
   patchWithRecovery,
   findDuplicates,
+  findSimilar,
 };

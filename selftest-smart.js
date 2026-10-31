@@ -120,6 +120,15 @@ eq(smart.findDuplicates(EXIST, { name: '老人驗', due: '2026-11-05' }), [], '�
 eq(smart.findDuplicates([{ id: 'c', name: '💯  Calculus　Exam', target_date: '2026-11-04' }], { name: 'calculus exam', due: '2026-11-04' }).length, 1, '全形空白／連續空白／大小寫');
 eq(smart.findDuplicates(EXIST, { name: '老人驗', due: null }), [], '無日期不比對');
 
+// 相似事件（只警示）：同日、名稱 CJK bigram＋英文數字 token Jaccard ≥ 0.5；同名不算相似（由 findDuplicates 管）
+const SIM_EXIST = [{ id: 's1', name: '📚 影像與視訊生成 Lab 4 Announcement', target_date: '2026-11-12' }];
+eq(smart.findSimilar(SIM_EXIST, { name: '📚 影像與視訊生成 Lab4-Flow Matching', due: '2026-11-12' }).map((x) => x.issue.id), ['s1'], '相似：同日相近名稱');
+eq(smart.findSimilar(SIM_EXIST, { name: '📚 影像與視訊生成 Lab4-Flow Matching', due: '2026-11-13' }), [], '相似：不同日不算');
+eq(smart.findSimilar(SIM_EXIST, { name: '影像與視訊生成 lab 4 announcement', due: '2026-11-12' }), [], '相似：同名交給 findDuplicates，不重複警示');
+eq(smart.findDuplicates(SIM_EXIST, { name: '影像與視訊生成 lab 4 announcement', due: '2026-11-12' }).length, 1, '同名仍由 findDuplicates 命中');
+eq(smart.findSimilar(SIM_EXIST, { name: '機器學習 HW2', due: '2026-11-12' }), [], '相似：無關名稱不算');
+eq(smart.findSimilar(SIM_EXIST, { name: '影像與視訊生成 Lab4', due: null }), [], '相似：無日期不比對');
+
 // ---------- patchWithRecovery（假 send／fetchAll） ----------
 async function recoveryTests() {
   const transportErr = Object.assign(new Error('timeout'), { name: 'TimeoutError' });
@@ -388,6 +397,25 @@ async function fixTests() {
     ok(res.filter((r) => r.skipped).length === 1 && res.filter((r) => r.ok && !r.skipped).length === 2, 'fix3 一筆略過、兩筆建立');
     ok(res.find((r) => r.skipped).id === res.find((r) => !r.skipped && r.due === '2026-11-04').id, 'fix3 略過那筆附第一筆的 id');
     ok(/建立 2 筆，略過 1 筆已有/.test(bot.buildAiCreateReport(res)), 'fix3 回報「建立 2 筆，略過 1 筆已有」');
+
+    // (3b) 相似不同名：確認卡加警示、仍會建立（不自動略過）、回報再提醒一次
+    store.push({ id: 'sim-1', name: '📚 影像與視訊生成 Lab 4 Announcement', target_date: '2026-11-12', description_html: '' });
+    const simEvents = [{ name: '影像與視訊生成 Lab4-Flow Matching', due: '2026-11-12', label: 'homework', desc: '', time: null, location: null }];
+    const simCard = bot.buildConfirmCard(simEvents, { existing: store, dupCheckFailed: false });
+    ok(/同日有相似事件「📚 影像與視訊生成 Lab 4 Announcement」（確認後仍會建立）/.test(simCard.text), 'sim 確認卡加相似警示');
+    ok(!/已有同名同日/.test(simCard.text), 'sim 相似不是同名，不標「已有同名同日」');
+    calls.length = 0;
+    const simRes = await bot.createAiEvents(simEvents);
+    ok(calls.filter((c) => c.method === 'POST').length === 1 && simRes[0].ok && !simRes[0].skipped, 'sim 相似不同名仍照常建立（POST 一次）');
+    ok(/⚠️ 同日有相似事件「📚 影像與視訊生成 Lab 4 Announcement」/.test(bot.buildAiCreateReport(simRes)), 'sim 建立回報帶相似警示');
+
+    // (3c) createPlaneIssue 把 source 寫進描述末尾一行（供之後精確比對）；沒有 source 時描述不變
+    calls.length = 0;
+    await bot.createPlaneIssue({ name: '📚 X', due: '2026-12-01', label: null, desc: '課程：X', source: 'e3:25900:240001:2026-12-01' });
+    await bot.createPlaneIssue({ name: '📚 Y', due: '2026-12-02', label: null, desc: '', source: 'gmail:18f2abc' });
+    await bot.createPlaneIssue({ name: '📚 Z', due: '2026-12-03', label: null, desc: '只有描述' });
+    const posts = calls.filter((c) => c.method === 'POST').map((c) => c.body.description_html);
+    eq(posts, ['<p>課程：X</p><p>source: e3:25900:240001:2026-12-01</p>', '<p>source: gmail:18f2abc</p>', '<p>只有描述</p>'], 'source 寫在描述末尾');
 
     // (4) interactionCreate 的 catch 清掉該使用者的 pendingUpdates（別人的不動）
     bot.pendingUpdates.clear();

@@ -211,7 +211,7 @@ function eveningNote(html) {
   const lines = descHtmlToText(html)
     .split('\n')
     .map((l) => l.replace(/\s+/g, ' ').trim())
-    .filter((l) => l && !/^(時間|地點)[:：]/.test(l));
+    .filter((l) => l && !/^(時間|地點)[:：]/.test(l) && !/^source:\s/i.test(l));
   if (!lines.length) return '';
   const hit = lines.filter((l) => BRING_RE.test(l));
   const text = (hit.length ? hit : lines).join(' ／ ');

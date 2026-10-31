@@ -473,6 +473,149 @@ const names = (calls) => calls.map((c) => c[0]);
     assert.deepEqual(names(d.api), []);
   });
 
+  // ===== (k) 相似事件（Plane 建立出口的最後一道防線） =====
+  const LAB_EMBED = {
+    ...SPEC_EMBED,
+    title: '影像與視訊生成 Lab4-Flow Matching',
+    fields: SPEC_EMBED.fields.map((f) => (f.name === '截止' ? { ...f, value: '2026-11-12（四）23:59' } : f)),
+    footer: { text: 'e3-course-watch · e3:25900:240001:2026-11-12' },
+  };
+  const LAB_SIMILAR = { id: 'sim', name: '📚 影像與視訊生成 Lab 4 Announcement', target_date: '2026-11-12', description_html: '' };
+  const statusOf = (call) => call[1].embeds[0].toJSON().fields.find((f) => f.name === '狀態').value;
+
+  test('(k) findSimilarIssues 名稱 Jaccard／同名／同課程 source／不同日', () => {
+    const f = (issues, o) => e3.findSimilarIssues(issues, o);
+    assert.equal(f([LAB_SIMILAR], { name: '📚 影像與視訊生成 Lab4-Flow Matching', due: '2026-11-12' })[0].reason, 'similar-name');
+    assert.equal(f([LAB_SIMILAR], { name: '📚 影像與視訊生成 Lab4-Flow Matching', due: '2026-11-13' }).length, 0, '不同日不算');
+    assert.equal(f([{ ...LAB_SIMILAR, name: '影像與視訊生成 Lab 4 Announcement' }], { name: '📚 影像與視訊生成 lab 4 announcement', due: '2026-11-12' })[0].reason, 'same-name');
+    assert.equal(f([{ id: 'o', name: '📚 機器學習 HW2', target_date: '2026-11-12' }], { name: '📚 影像與視訊生成 Lab4', due: '2026-11-12' }).length, 0, '無關名稱不算');
+    // (c) 同課程：描述含 e3:<courseId>: 前綴；課程 id 不同不算
+    const bySource = { id: 's', name: '完全不同的名字 ABC', target_date: '2026-11-12', description_html: '<p>x</p><p>source: e3:25900:111:2026-11-12</p>' };
+    assert.equal(f([bySource], { name: '📚 影像與視訊生成 Lab4', due: '2026-11-12', candidateId: 'e3:25900:240001:2026-11-12' })[0].reason, 'same-source');
+    assert.equal(f([bySource], { name: '📚 影像與視訊生成 Lab4', due: '2026-11-12', candidateId: 'e3:25901:240001:2026-11-12' }).length, 0);
+    assert.equal(f([bySource], { name: '📚 影像與視訊生成 Lab4', due: '2026-11-12', candidateId: 'gmail:abc' }).length, 0, 'gmail 卡不走 (c)');
+    assert.equal(f([LAB_SIMILAR], { name: 'x', due: null }).length, 0);
+  });
+
+  test('(k) decideAction 回傳 similar（reasons 與 matches 同序）；同名異日仍 update', () => {
+    const r = e3.decideAction({ name: '📚 影像與視訊生成 Lab4-Flow Matching', dueDate: '2026-11-12', existingIssues: [LAB_SIMILAR] });
+    assert.equal(r.action, 'similar');
+    assert.equal(r.matches[0].id, 'sim');
+    assert.deepEqual(r.reasons, ['similar-name']);
+    const u = e3.decideAction({ name: '📚 影像與視訊生成 Lab4', dueDate: '2026-11-12', existingIssues: [{ id: 'u', name: '影像與視訊生成 Lab4', target_date: '2026-11-10' }] });
+    assert.equal(u.action, 'update');
+  });
+
+  test('(k) parseCardEmbed 吃 gmail-watch footer', () => {
+    const p = e3.parseCardEmbed({ ...SPEC_EMBED, footer: { text: 'gmail-watch · gmail:18f2abc' } }, LABELS);
+    assert.equal(p.candidateId, 'gmail:18f2abc');
+    assert.equal(e3.parseCardEmbed({ ...SPEC_EMBED, footer: { text: 'other · x' } }, LABELS).candidateId, null);
+  });
+
+  test('(k) isE3Interaction 認得 plane_e3_force', () => {
+    const btn = (id) => ({ isButton: () => true, isModalSubmit: () => false, customId: id });
+    assert.equal(e3.E3_BUTTON_FORCE, 'plane_e3_force');
+    assert.equal(e3.isE3Interaction(btn('plane_e3_force')), true);
+  });
+
+  await testAsync('(k) 相似不同名 → 不建、卡片換成「仍要建立／略過」、followUp 警示', async () => {
+    const it = fakeButton('plane_e3_ok', LAB_EMBED);
+    const d = fakeDeps([LAB_SIMILAR]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), ['fetch'], '不可 create／update');
+    assert.deepEqual(names(it.calls), ['deferUpdate', 'message.edit', 'followUp']);
+    const payload = it.calls[1][1];
+    assert.match(statusOf(it.calls[1]), /^⚠️ Plane 同日已有「📚 影像與視訊生成 Lab 4 Announcement」.*可能是同一件事/);
+    assert.match(statusOf(it.calls[1]), /https:\/\/app\.plane\.so\/x\/sim/);
+    const row = payload.components[0].toJSON();
+    assert.deepEqual(row.components.map((c) => c.custom_id), ['plane_e3_force', 'plane_e3_skip']);
+    assert.deepEqual(row.components.map((c) => c.label), ['仍要建立', '略過']);
+    assert.equal(it.calls[2][1].ephemeral, true);
+  });
+
+  await testAsync('(k) 按「仍要建立」→ 才 create（帶 source）、卡片改綠拿掉按鈕；防連點鎖涵蓋 force', async () => {
+    const first = fakeButton('plane_e3_force', LAB_EMBED);
+    const second = fakeButton('plane_e3_force', LAB_EMBED);
+    first.message.id = second.message.id = 'msg-force-click';
+    const d = fakeDeps([LAB_SIMILAR]);
+    const slowFetch = d.fetchAllIssues;
+    d.fetchAllIssues = async () => { await new Promise((r) => setTimeout(r, 50)); return slowFetch(); };
+    await Promise.all([e3.handleE3Interaction(first, d), e3.handleE3Interaction(second, d)]);
+    assert.deepEqual(names(d.api), ['fetch', 'create'], '連點只建一筆');
+    assert.equal(d.api[1][1].name, '📚 影像與視訊生成 Lab4-Flow Matching');
+    assert.equal(d.api[1][1].source, 'e3:25900:240001:2026-11-12');
+    assert.match(second.calls[1][1].content, /處理中/);
+    assert.equal(first.calls[1][1].embeds[0].toJSON().color, e3.COLOR_DONE);
+    assert.match(statusOf(first.calls[1]), /^✅ 已加入 Plane/);
+    assert.deepEqual(first.calls[1][1].components, []);
+  });
+
+  await testAsync('(k) 「仍要建立」時若已出現同名同日 → 仍 skipDuplicate，不建', async () => {
+    const it = fakeButton('plane_e3_force', LAB_EMBED);
+    const d = fakeDeps([LAB_SIMILAR, { id: 'same', name: '影像與視訊生成 Lab4-Flow Matching', target_date: '2026-11-12' }]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), ['fetch']);
+    assert.match(statusOf(it.calls[1]), /^ℹ️ Plane 已有/);
+  });
+
+  await testAsync('(k) 警告卡上按「略過」→ 不打 API、卡片改灰', async () => {
+    const it = fakeButton('plane_e3_skip', LAB_EMBED);
+    const d = fakeDeps([LAB_SIMILAR]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), []);
+    assert.equal(it.calls[1][1].embeds[0].toJSON().color, e3.COLOR_SKIP);
+  });
+
+  await testAsync('(k) 同名同日 → skipDuplicate 不變（即使另有相似事件）', async () => {
+    const it = fakeButton('plane_e3_ok', LAB_EMBED);
+    const d = fakeDeps([LAB_SIMILAR, { id: 'same', name: '📚 影像與視訊生成 Lab4-Flow Matching', target_date: '2026-11-12' }]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), ['fetch']);
+    assert.match(statusOf(it.calls[1]), /^ℹ️ Plane 已有「📚 影像與視訊生成 Lab4-Flow Matching」/);
+  });
+
+  await testAsync('(k) 不同日的相似名 → create', async () => {
+    const it = fakeButton('plane_e3_ok', LAB_EMBED);
+    const d = fakeDeps([{ ...LAB_SIMILAR, target_date: '2026-11-19' }]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), ['fetch', 'create']);
+  });
+
+  await testAsync('(k) E3 同課程 source 命中（名字完全不像）→ similar 不建', async () => {
+    const it = fakeButton('plane_e3_ok', LAB_EMBED);
+    const d = fakeDeps([{ id: 'src', name: '📚 Lab4', target_date: '2026-11-12', description_html: '<p>source: e3:25900:240999:2026-11-12</p>' }]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), ['fetch']);
+    assert.match(statusOf(it.calls[1]), /同一門課的候選/);
+  });
+
+  await testAsync('(k) gmail 卡：相似→不建；按 force→建立且 source=gmail id', async () => {
+    const gmailEmbed = {
+      title: '繳交 114 學年度獎學金申請表單',
+      fields: [{ name: '截止', value: '2026-11-20（五）17:00' }, { name: '類型', value: 'remind' }, { name: '描述', value: '來自信件' }],
+      footer: { text: 'gmail-watch · gmail:18f2abc' },
+    };
+    const near = { id: 'g1', name: '繳交 114 學年度獎學金申請表', target_date: '2026-11-20' };
+    const a = fakeButton('plane_e3_ok', gmailEmbed);
+    const da = fakeDeps([near]);
+    await e3.handleE3Interaction(a, da);
+    assert.deepEqual(names(da.api), ['fetch']);
+    assert.equal(a.calls[1][1].components[0].toJSON().components[0].custom_id, 'plane_e3_force');
+    const b = fakeButton('plane_e3_force', gmailEmbed);
+    const db = fakeDeps([near]);
+    await e3.handleE3Interaction(b, db);
+    assert.deepEqual(names(db.api), ['fetch', 'create']);
+    assert.equal(db.api[1][1].source, 'gmail:18f2abc');
+  });
+
+  await testAsync('(k) 警告卡經 ✏️ 修改送出 → 用修改值重判，不相似就 create', async () => {
+    const it = fakeModal({ name: '完全無關的新名字', due: '2026-11-12', label: 'remind', desc: '' }, LAB_EMBED);
+    const d = fakeDeps([LAB_SIMILAR]);
+    await e3.handleE3Interaction(it, d);
+    assert.deepEqual(names(d.api), ['fetch', 'create']);
+    assert.equal(d.api[1][1].source, 'e3:25900:240001:2026-11-12');
+  });
+
   console.log(`\n${pass} PASS, ${fail} FAIL`);
   if (fail > 0) process.exitCode = 1;
 })();

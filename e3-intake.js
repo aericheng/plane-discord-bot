@@ -10,6 +10,8 @@
 const logger = require('./log');
 const {
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   EmbedBuilder,
   ModalBuilder,
   TextInputBuilder,
@@ -19,8 +21,9 @@ const {
 const E3_BUTTON_OK = 'plane_e3_ok';
 const E3_BUTTON_EDIT = 'plane_e3_edit';
 const E3_BUTTON_SKIP = 'plane_e3_skip';
+const E3_BUTTON_FORCE = 'plane_e3_force'; // 「仍要建立」：相似事件警告卡上的按鈕，按了才真的 create
 const E3_MODAL_ID = 'plane_e3_modal';
-const E3_BUTTON_IDS = new Set([E3_BUTTON_OK, E3_BUTTON_EDIT, E3_BUTTON_SKIP]);
+const E3_BUTTON_IDS = new Set([E3_BUTTON_OK, E3_BUTTON_EDIT, E3_BUTTON_SKIP, E3_BUTTON_FORCE]);
 
 // 契約「顏色」節：完成改綠、略過改灰
 const COLOR_DONE = 0x57f287;
@@ -31,7 +34,8 @@ const STATUS_FIELD = '狀態';
 const FIELD_DUE = '截止';
 const FIELD_LABEL = '類型';
 const FIELD_DESC = '描述';
-const FOOTER_PREFIX = 'e3-course-watch · ';
+// 兩種上游卡共用同一套 custom_id 與 handler：e3-course-watch（candidateId 形如 e3:…）與 gmail-watch（gmail:…）
+const FOOTER_PREFIXES = ['e3-course-watch · ', 'gmail-watch · '];
 
 // Discord 上限（embed title 256、field value 1024、modal text input value 4000、placeholder 100）
 const MAX_TITLE = 256;
@@ -86,7 +90,8 @@ function parseCardEmbed(embed, LABELS) {
   const desc = fieldValue(embed, FIELD_DESC).trim();
   const url = (embed && embed.url) || null;
   const footer = (embed && embed.footer && embed.footer.text) || '';
-  const candidateId = footer.startsWith(FOOTER_PREFIX) ? footer.slice(FOOTER_PREFIX.length).trim() || null : null;
+  const prefix = FOOTER_PREFIXES.find((p) => footer.startsWith(p));
+  const candidateId = prefix ? footer.slice(prefix.length).trim() || null : null;
   return { name, dueDate, dueRaw, labelName: label ? label.name : DEFAULT_LABEL_NAME, desc, url, candidateId };
 }
 
@@ -101,13 +106,80 @@ function normalizeName(s) {
     .toLowerCase();
 }
 
+// ===== 相似事件判定（Plane 建立出口的最後一道防線） =====
+// 同 target_date 且符合任一條才算相似：
+//   (a) 正規化名稱相同（reason 'same-name'）
+//   (b) 名稱去 emoji 前綴後，CJK bigram＋英文／數字 token 的 Jaccard ≥ 0.5（'similar-name'）
+//   (c) 候選卡 candidateId 為 e3:<courseId>:… 且既有事件描述含同課程前綴 e3:<courseId>:（'same-source'）
+//       描述裡的 candidateId 由 createPlaneIssue 在末尾寫一行 `source: <candidateId>`。
+const SIMILAR_THRESHOLD = 0.5;
+
+// CJK 連續字串取 bigram（單字成串就取單字）；英文與數字分開成 token（Lab4 → lab、4）
+function nameTokens(name) {
+  const text = normalizeName(name);
+  const tokens = new Set();
+  for (const m of text.matchAll(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu)) {
+    const run = m[0];
+    if (run.length === 1) tokens.add(run);
+    else for (let i = 0; i < run.length - 1; i++) tokens.add(run.slice(i, i + 2));
+  }
+  for (const m of text.matchAll(/[a-z]+|\d+/g)) tokens.add(m[0]);
+  return tokens;
+}
+
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter += 1;
+  return inter / (a.size + b.size - inter);
+}
+
+function e3CoursePrefix(candidateId) {
+  const m = /^(e3:[^:\s]+:)/.exec(String(candidateId || ''));
+  return m ? m[1] : null;
+}
+
+function issueDescText(issue) {
+  return [issue.description_html, issue.description_stripped, typeof issue.description === 'string' ? issue.description : '']
+    .filter(Boolean)
+    .join('\n');
+}
+
+// 回傳 [{ issue, reason }]（reason 優先序：same-name > same-source > similar-name）；沒有日期或沒有名稱 → []
+function findSimilarIssues(issues, { name, due, candidateId }) {
+  if (!due) return [];
+  const key = normalizeName(name);
+  const tokens = nameTokens(name);
+  const prefix = e3CoursePrefix(candidateId);
+  const out = [];
+  for (const issue of issues || []) {
+    if (!issue || issue.target_date !== due) continue;
+    if (key && normalizeName(issue.name) === key) out.push({ issue, reason: 'same-name' });
+    else if (prefix && issueDescText(issue).includes(prefix)) out.push({ issue, reason: 'same-source' });
+    else if (jaccard(tokens, nameTokens(issue.name)) >= SIMILAR_THRESHOLD) out.push({ issue, reason: 'similar-name' });
+  }
+  return out;
+}
+
+const REASON_TEXT = {
+  'same-name': '同名',
+  'same-source': '同一門課的候選',
+  'similar-name': '名稱相近',
+};
+
 // ===== 去重決策 =====
 // name 已含 emoji 前綴（finalName）；existingIssues 為 fetchAllIssues() 的原始 API 回應。
-// 同名 0 筆 → create；1 筆同日 → skipDuplicate；1 筆異日 → update；≥2 筆 → ambiguous（不自動處理）。
-function decideAction({ name, dueDate, existingIssues }) {
+// 同名 0 筆 → 再找同日相似事件：有 → similar（不建，等使用者按「仍要建立」）、沒有 → create；
+// 1 筆同日 → skipDuplicate；1 筆異日 → update；≥2 筆 → ambiguous（不自動處理）。
+// similar 時 matches 為相似的 issue 陣列，reasons 與之同序。candidateId 選填（啟用 E3 同課程判定）。
+function decideAction({ name, dueDate, existingIssues, candidateId }) {
   const key = normalizeName(name);
   const matches = (existingIssues || []).filter((issue) => issue && normalizeName(issue.name) === key);
-  if (matches.length === 0) return { action: 'create', matches };
+  if (matches.length === 0) {
+    const similar = findSimilarIssues(existingIssues, { name, due: dueDate, candidateId });
+    if (similar.length > 0) return { action: 'similar', matches: similar.map((x) => x.issue), reasons: similar.map((x) => x.reason) };
+    return { action: 'create', matches };
+  }
   if (matches.length >= 2) return { action: 'ambiguous', matches };
   return { action: matches[0].target_date === dueDate ? 'skipDuplicate' : 'update', matches };
 }
@@ -272,7 +344,8 @@ async function handleE3InteractionInner(interaction, deps) {
       });
     }
     const label = findLabel(LABELS, parsed.labelName) || findLabel(LABELS, DEFAULT_LABEL_NAME);
-    return applyCandidate(interaction, embed, { name: parsed.name, dueDate: parsed.dueDate, label, desc: parsed.desc }, deps, false);
+    const force = interaction.customId === E3_BUTTON_FORCE;
+    return applyCandidate(interaction, embed, { name: parsed.name, dueDate: parsed.dueDate, label, desc: parsed.desc }, deps, false, force);
   }
 
   if (interaction.isModalSubmit()) {
@@ -293,12 +366,21 @@ async function handleE3InteractionInner(interaction, deps) {
       deps
     );
     if (!checked.ok) return interaction.followUp({ content: `❌ ${checked.error}`, ephemeral: true });
-    return applyCandidate(interaction, embed, checked.value, deps, true);
+    return applyCandidate(interaction, embed, checked.value, deps, true, false);
   }
 }
 
+// 相似事件警告卡的按鈕列：「仍要建立」「略過」（略過沿用 plane_e3_skip）
+function buildSimilarRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(E3_BUTTON_FORCE).setLabel('仍要建立').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(E3_BUTTON_SKIP).setLabel('略過').setStyle(ButtonStyle.Secondary)
+  );
+}
+
 // 建立／更新／去重的共同流程（✅ 與 ✏️ submit 都走這裡）。edited=true 時把卡片欄位改成使用者修改後的值。
-async function applyCandidate(interaction, embed, { name, dueDate, label, desc }, deps, edited) {
+// force=true（按「仍要建立」）：相似事件不再擋，直接 create；同名同日仍照舊 skipDuplicate。
+async function applyCandidate(interaction, embed, { name, dueDate, label, desc }, deps, edited, force = false) {
   const { createPlaneIssue, updatePlaneIssue, fetchAllIssues, issueUrl, log = logger.log } = deps;
   const finalName = label.emoji ? `${label.emoji} ${name}` : name;
   const edits = edited ? { name, dueDate, labelName: label.name, desc } : { labelName: label.name };
@@ -311,8 +393,25 @@ async function applyCandidate(interaction, embed, { name, dueDate, label, desc }
     return interaction.followUp({ content: `❌ 讀取 Plane 現有事件失敗：${err.message}\n卡片保留，可再按一次。`, ephemeral: true });
   }
 
-  const { action, matches } = decideAction({ name: finalName, dueDate, existingIssues: existing });
-  log(`[bot] e3 ${edited ? 'edit' : 'ok'}: ${action} "${finalName}" ${dueDate} (matches=${matches.length})`);
+  const candidateId = parseCardEmbed(embed, deps.LABELS).candidateId;
+  const decided = decideAction({ name: finalName, dueDate, existingIssues: existing, candidateId });
+  const { matches } = decided;
+  const action = force && decided.action === 'similar' ? 'create' : decided.action;
+  log(`[bot] e3 ${force ? 'force' : edited ? 'edit' : 'ok'}: ${action} "${finalName}" ${dueDate} (matches=${matches.length})`);
+
+  if (action === 'similar') {
+    const found = matches[0];
+    const why = REASON_TEXT[decided.reasons[0]] || '相似';
+    const more = matches.length > 1 ? `（另有 ${matches.length - 1} 筆相似）` : '';
+    const status = `⚠️ Plane 同日已有「${found.name}」（${why}），可能是同一件事${more}
+[開啟 issue](${issueUrl(found.id)})
+要照樣建立請按「仍要建立」，否則按「略過」。`;
+    await interaction.message.edit({ embeds: [buildResultEmbed(embed, { status, ...edits })], components: [buildSimilarRow()] });
+    return interaction.followUp({
+      content: `⚠️ Plane ${dueDate} 已有「${found.name}」，跟「${finalName}」可能是同一件事；沒有建立。要建立請按卡片上的「仍要建立」。`,
+      ephemeral: true,
+    });
+  }
 
   if (action === 'ambiguous') {
     const status = `⚠️ Plane 有 ${matches.length} 筆同名事件，請手動處理`;
@@ -326,7 +425,7 @@ async function applyCandidate(interaction, embed, { name, dueDate, label, desc }
   let status;
   try {
     if (action === 'create') {
-      const issue = await createPlaneIssue({ name: finalName, due: dueDate, label, desc });
+      const issue = await createPlaneIssue({ name: finalName, due: dueDate, label, desc, source: candidateId });
       status = `✅ 已加入 Plane：${issue.name}（${issue.target_date}）\n[開啟 issue](${issueUrl(issue.id)})`;
     } else if (action === 'skipDuplicate') {
       const found = matches[0];
@@ -353,6 +452,7 @@ module.exports = {
   E3_BUTTON_OK,
   E3_BUTTON_EDIT,
   E3_BUTTON_SKIP,
+  E3_BUTTON_FORCE,
   E3_MODAL_ID,
   COLOR_DONE,
   COLOR_SKIP,
@@ -360,6 +460,8 @@ module.exports = {
   parseCardEmbed,
   normalizeName,
   decideAction,
+  findSimilarIssues,
+  REASON_TEXT,
   validateModalInput,
   buildResultEmbed,
   buildEditModal,
