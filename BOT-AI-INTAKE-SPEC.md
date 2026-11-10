@@ -19,7 +19,7 @@
 
 ## 解析契約
 
-prompt 必含：今天日期＋星期（bot 端計算，含 `Asia/Taipei` 時區意識）、LABELS 清單與語意（test=考試/測驗 💯、homework=作業/繳交 📚、presentation=報告/簡報 🗣️、remind=一般提醒 💡、competition=比賽 🏆）、使用者原文。要求**只輸出 JSON**（無 markdown fence、無說明文字）：
+prompt 必含：今天日期＋星期（bot 端計算，含 `Asia/Taipei` 時區意識）、LABELS 清單與語意（test=考試/測驗 💯、homework=作業/繳交 📚、presentation=報告/簡報 🗣️、remind=一般提醒（只有 `attend`=true 才加 💡）、competition=比賽 🏆）、使用者原文。要求**只輸出 JSON**（無 markdown fence、無說明文字）：
 
 ```json
 {
@@ -33,6 +33,7 @@ prompt 必含：今天日期＋星期（bot 端計算，含 `Asia/Taipei` 時區
 bot 端的決定性驗證（不信任 AI 輸出）：
 - `JSON.parse` 失敗 → 重試一次（prompt 加「上次輸出不是合法 JSON」）→ 再失敗走 fallback。輸出若包 ```json fence 要先剝掉再 parse（模型常見行為，剝 fence 屬容錯不屬信任）。
 - `due` 必須是合法 `YYYY-MM-DD` 或 null；過去的日期保留但在確認卡標 ⚠️。
+- `attend`（每筆事件的布林，是否需要本人到場：看牙醫／開會／面試／coffee chat／活動／補課＝true；買東西／查 deadline／繳費／寄信／線上填表＝false）：缺漏或非布林一律 false。只有 label=remind（含 null 預設 remind）且 attend=true 才在名稱前加 💡；確認卡顯示與實際建立（含查重）用同一個名稱。
 - `label` 必須 ∈ LABELS 的 key，否則設為 null；null label 在建立時 fallback 成 `remind` 並在確認卡標「(預設)」。
 - `events` 為空且無 questions → 回「我看不出這段文字裡有事件」＋原文長度提示。
 

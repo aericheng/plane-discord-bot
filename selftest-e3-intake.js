@@ -616,6 +616,39 @@ const names = (calls) => calls.map((c) => c[0]);
     assert.equal(d.api[1][1].source, 'e3:25900:240001:2026-11-12');
   });
 
+  await testAsync('(l) 類型留空／remind → 名稱不加 emoji；「remind（要出席）」→ 💡，同一個 label id；其他 label 前綴不變', async () => {
+    const run = async (label) => {
+      const it = fakeModal({ name: '買講義', due: '2026-11-12', label, desc: '' }, LAB_EMBED);
+      const d = fakeDeps([]);
+      await e3.handleE3Interaction(it, d);
+      return d.api.find((c) => c[0] === 'create')[1];
+    };
+    const blank = await run('');
+    const plain = await run('remind');
+    const attend = await run('remind（要出席）');
+    const attendAscii = await run('Remind(要出席)');
+    const hw = await run('homework');
+    assert.equal(blank.name, '買講義');
+    assert.equal(plain.name, '買講義');
+    assert.equal(attend.name, '💡 買講義');
+    assert.equal(attendAscii.name, '💡 買講義');
+    assert.equal(hw.name, '📚 買講義');
+    const remindId = LABELS.find((l) => l.name === 'remind').id;
+    assert.equal(plain.label.id, remindId);
+    assert.equal(attend.label.id, remindId);
+    assert.equal(LABELS.filter((l) => l.id === remindId).length, 1);
+  });
+
+  test('(l) parseCardEmbed／validateModalInput 認得 remind（要出席）並回寫同名，LABELS 反查不受影響', () => {
+    const p = e3.parseCardEmbed(withField(SPEC_EMBED, '類型', 'remind（要出席）'), LABELS);
+    assert.equal(p.labelName, 'remind（要出席）');
+    const v = e3.validateModalInput({ name: 'x', dueInput: '2026-10-01', labelInput: 'remind（要出席）', desc: '' }, deps);
+    assert.equal(v.ok, true);
+    assert.equal(v.value.label.emoji, '💡');
+    assert.equal(v.value.label.name, 'remind');
+    assert.equal(LABELS.find((l) => l.name === 'remind').emoji, '');
+  });
+
   console.log(`\n${pass} PASS, ${fail} FAIL`);
   if (fail > 0) process.exitCode = 1;
 })();

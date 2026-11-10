@@ -1,7 +1,7 @@
 // Plane Discord Bot
 // 對話式建立 Plane 事件：傳事件名稱 → 問 Due date → 問 label → 問 description → 建立 issue。
 // Due date 支援單日（7/30、今天、明天）與週期（9/1到12/20的每個禮拜三 → 範圍內每個週三各建一筆）。
-// label 對應的表情符號會加在事件名稱前（test 💯 / homework 📚 / presentation 🗣️ / remind 💡 / competition 🏆）。
+// label 對應的表情符號會加在事件名稱前（test 💯 / homework 📚 / presentation 🗣️ / remind（要出席才加）💡 / competition 🏆）。
 // 建好的事件會出現在 Plane，並由既有的 Apps Script 每小時同步進 Google 日曆。
 
 const logger = require('./log');
@@ -23,6 +23,7 @@ const crypto = require('node:crypto');
 const { runAiParse, killActiveClaudeChildren, taipeiTodayInfo } = require('./ai-intake');
 const { isE3Interaction, handleE3Interaction } = require('./e3-intake');
 const smart = require('./smart-edit');
+const { ATTEND_LABEL_NAME, withAttend, resolveLabel, labelDisplayName } = require('./label-util');
 const digest = require('./digest');
 
 // 全域錯誤 handler：單一 promise 失敗只記 log；同步例外記 log 後以 exit 1 結束交給 start-bot.cmd 重啟
@@ -51,7 +52,7 @@ const LABELS = [
   { name: 'test',         id: 'c7b2c20a-0054-4970-b9ee-4adf38a91c95', emoji: '💯' },
   { name: 'homework',     id: '005f30ad-8225-4b34-94d2-51d4f3cbd62c', emoji: '📚' },
   { name: 'presentation', id: 'd56611af-94a6-4397-91f9-40ff9ea965bc', emoji: '🗣️' },
-  { name: 'remind',       id: '66c31e72-c4f2-44e4-a630-a7c9d1480d18', emoji: '💡' },
+  { name: 'remind',       id: '66c31e72-c4f2-44e4-a630-a7c9d1480d18', emoji: '', attendEmoji: '💡' }, // 只有「要出席」才加 💡，見 label-util.js
   { name: 'competition',  id: '3405ea85-9135-426f-9b4f-9d2d7d551d24', emoji: '🏆' },
   { name: 'work',         id: '501c83ce-fe04-415f-b31e-46aea26eb2a4', emoji: '' },
   { name: 'class',        id: '978cdc2f-adb1-4743-aa6a-f1dec468e8d7', emoji: '' },
@@ -518,6 +519,9 @@ function labelMenu() {
     const opt = new StringSelectMenuOptionBuilder().setLabel(l.name).setValue(l.name);
     if (l.emoji) opt.setEmoji(l.emoji);
     menu.addOptions(opt);
+    if (l.attendEmoji) {
+      menu.addOptions(new StringSelectMenuOptionBuilder().setLabel(ATTEND_LABEL_NAME).setValue(ATTEND_LABEL_NAME).setEmoji(l.attendEmoji));
+    }
   }
   return new ActionRowBuilder().addComponents(menu);
 }
@@ -525,7 +529,7 @@ function labelMenu() {
 function askDescText(session) {
   const label = session.label;
   return [
-    `🏷️ label：${label.id ? `${label.emoji ? label.emoji + ' ' : ''}${label.name}` : '（無）'}`,
+    `🏷️ label：${label.id ? `${label.emoji ? label.emoji + ' ' : ''}${labelDisplayName(label)}` : '（無）'}`,
     `📝 要加 description 嗎？直接輸入內容（可多行），不用就打 \`跳過\`。`,
   ].join('\n');
 }
@@ -573,7 +577,7 @@ async function finishCreate(session, desc, replyFn) {
   }
   lines.push(...similarNotes);
   if (!dupList.issues) lines.push('⚠️ 這次沒辦法查重（抓不到 Plane 列表），請自行確認有沒有重複。');
-  lines.push(`🏷️ label：${label.id ? label.name : '（無）'}`);
+  lines.push(`🏷️ label：${label.id ? labelDisplayName(label) : '（無）'}`);
   if (desc && created.length > 0) lines.push(`📝 description：已寫入`);
   const recoveredCount = created.filter((c) => c.recovered).length;
   if (recoveredCount > 0) lines.push(`🐢 Plane 回應逾時，其中 ${recoveredCount} 筆是重查列表確認已建立的（不用重送）。`);
@@ -619,12 +623,14 @@ function sortEventsForCard(events) {
   });
 }
 
-function labelInfoFor(labelName) {
-  return LABELS.find((l) => l.name === labelName) || LABELS.find((l) => l.name === 'remind');
+// attend：AI 抽出的「是否需要本人到場」；只有 remind（含 label 為 null 的預設 remind）且 attend===true 才帶 💡。
+function labelInfoFor(labelName, attend = false) {
+  const base = LABELS.find((l) => l.name === labelName) || LABELS.find((l) => l.name === 'remind');
+  return withAttend(base, attend === true);
 }
 
 function cardLineFor(ev, idx, todayIso, isDup = false, sameCard = false, similarName = null) {
-  const info = labelInfoFor(ev.label || 'remind');
+  const info = labelInfoFor(ev.label || 'remind', ev.attend);
   const labelSuffix = ev.label ? '' : '（預設）';
   let dueDisplay;
   if (!ev.due) dueDisplay = '❓需要日期';
@@ -648,7 +654,7 @@ function buildConfirmCard(events, { existing = null, dupCheckFailed = false } = 
   const header = `🤖 從你的文字抽出 ${events.length} 筆事件：`;
   const seenKeys = new Set(); // 同一張卡內兩筆同名同日（正規化後）：只有第一筆會建
   const lines = sorted.map((e, i) => {
-    const emoji = labelInfoFor(e.label || 'remind').emoji;
+    const emoji = labelInfoFor(e.label || 'remind', e.attend).emoji;
     const finalName = emoji ? `${emoji} ${e.name}` : e.name;
     const isDup = !!existing && smart.findDuplicates(existing, { name: finalName, due: e.due }).length > 0;
     const key = smart.dupKey(finalName, e.due);
@@ -685,7 +691,7 @@ async function createAiEvents(events) {
   if (!dupList.issues) results.dupCheckFailed = true;
   const createdByKey = new Map(); // 本批已建立成功的 key -> 結果；同批第二筆同名同日直接略過
   for (const ev of sorted) {
-    const label = labelInfoFor(ev.label || 'remind');
+    const label = labelInfoFor(ev.label || 'remind', ev.attend);
     const finalName = label.emoji ? `${label.emoji} ${ev.name}` : ev.name;
     const dup = dupList.issues ? smart.findDuplicates(dupList.issues, { name: finalName, due: ev.due }) : [];
     if (dup.length > 0) {
@@ -1383,10 +1389,10 @@ client.on('messageCreate', async (msg) => {
       }
 
       if (session.step === 'label') {
-        const typed = LABELS.find((l) => l.name.toLowerCase() === text.toLowerCase());
+        const typed = resolveLabel(LABELS, text);
         if (!typed) {
           return msg.reply(
-            `沒有「${text}」這個 label。可用：${LABELS.map((l) => l.name).join('、')}，或用上面的選單選。`
+            `沒有「${text}」這個 label。可用：${LABELS.map((l) => l.name).join('、')}、${ATTEND_LABEL_NAME}，或用上面的選單選。`
           );
         }
         session.label = typed;
@@ -1475,7 +1481,7 @@ client.on('interactionCreate', async (interaction) => {
         return await interaction.reply({ content: '這個選單已過期，請重新傳事件名稱給我。', ephemeral: true });
       }
 
-      session.label = LABELS.find((l) => l.name === interaction.values[0]) || LABELS[LABELS.length - 1];
+      session.label = resolveLabel(LABELS, interaction.values[0]) || LABELS[LABELS.length - 1];
       session.step = 'desc';
       await interaction.deferUpdate();
       await interaction.editReply({
@@ -1531,6 +1537,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  labelMenu, // 測試用
   parseSingleDate,
   parseDueInput,
   parseQueryInput,

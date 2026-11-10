@@ -209,6 +209,59 @@ async function run() {
     global.fetch = realFetch2;
   }
 
+  // ===== remind 只有 attend=true 才加 💡 =====
+  {
+    const ai = require('./ai-intake');
+    const mk = (extra) => ({ name: '事件', due: '2026-11-12', desc: '', time: null, location: null, ...extra });
+    const norm = (e) => ai.normalizeAiResult ? ai.normalizeAiResult({ intent: 'create', events: [e] }).events[0] : null;
+    if (ai.normalizeAiResult) {
+      ok(norm({ name: 'a', label: 'remind', attend: true }).attend === true, 'normalize: attend true 保留');
+      ok(norm({ name: 'a', label: 'remind', attend: false }).attend === false, 'normalize: attend false');
+      ok(norm({ name: 'a', label: 'remind' }).attend === false, 'normalize: attend 缺漏 → false');
+      ok(norm({ name: 'a', label: 'remind', attend: 'true' }).attend === false, 'normalize: attend 非布林 → false');
+    }
+    const lineOf = (ev) => bot.buildConfirmCard([ev], { existing: [], dupCheckFailed: false }).text.split('\n')[1];
+    ok(lineOf(mk({ label: 'remind', attend: true })).includes('1. 💡 事件'), '卡片: remind+attend true → 💡');
+    ok(lineOf(mk({ label: 'remind', attend: false })).startsWith('1. 事件'), '卡片: remind+attend false → 無 emoji');
+    ok(lineOf(mk({ label: 'remind' })).startsWith('1. 事件'), '卡片: remind+attend 缺漏 → 無 emoji');
+    ok(lineOf(mk({ label: null, attend: true })).includes('1. 💡 事件'), '卡片: label null 預設 remind+attend true → 💡');
+    ok(lineOf(mk({ label: null, attend: false })).startsWith('1. 事件'), '卡片: label null+attend false → 無 emoji');
+    ok(lineOf(mk({ label: 'homework', attend: true })).includes('1. 📚 事件'), '卡片: homework 不受 attend 影響');
+    ok(lineOf(mk({ label: 'test', attend: false })).includes('1. 💯 事件'), '卡片: test 前綴不變');
+    // 實際建立的名稱與卡片一致、且都送 remind 同一個 label id
+    const remindId = bot.LABELS.find((l) => l.name === 'remind').id;
+    const posts = [];
+    const hooksFetch3 = bot.smartHooks.fetchAll;
+    const realFetch3 = global.fetch;
+    bot.smartHooks.fetchAll = async () => [];
+    global.fetch = async (url, opts = {}) => {
+      if ((opts.method || 'GET') === 'POST') { const b = JSON.parse(opts.body); posts.push(b); return { ok: true, status: 201, json: async () => ({ id: 'id' + posts.length, name: b.name, target_date: b.target_date }) }; }
+      return { ok: true, status: 200, json: async () => ({ results: [], next_page_results: false }) };
+    };
+    try {
+      await bot.createAiEvents([
+        mk({ name: '看牙醫', due: '2026-11-12', label: 'remind', attend: true }),
+        mk({ name: '買講義', due: '2026-11-13', label: 'remind', attend: false }),
+        mk({ name: '繳費', due: '2026-11-14', label: null }),
+      ]);
+      ok(posts.map((p) => p.name).join('|') === '💡 看牙醫|買講義|繳費', `建立名稱（${posts.map((p) => p.name).join('|')}）`);
+      ok(posts.every((p) => p.labels && p.labels[0] === remindId), 'attend 與否都送同一個 remind label id');
+    } finally {
+      bot.smartHooks.fetchAll = hooksFetch3;
+      global.fetch = realFetch3;
+    }
+    // LABELS 依 name／id 反查不受影響
+    ok(bot.LABELS.filter((l) => l.id === remindId).length === 1 && bot.LABELS.find((l) => l.id === remindId).emoji === '', 'LABELS: remind 單列且 emoji 為空');
+    // 下拉選單：兩個 remind 選項，選「要出席」→ 💡、同一個 id；選 remind → 無 emoji
+    const opts = bot.labelMenu().components[0].options.map((o) => o.data);
+    const remindOpts = opts.filter((o) => String(o.value).startsWith('remind'));
+    ok(remindOpts.length === 2 && remindOpts.some((o) => o.value === 'remind') && remindOpts.some((o) => o.value === 'remind（要出席）'), '選單: 兩個 remind 選項');
+    const { resolveLabel } = require('./label-util');
+    const a = resolveLabel(bot.LABELS, 'remind（要出席）');
+    const b = resolveLabel(bot.LABELS, 'remind');
+    ok(a.id === remindId && b.id === remindId && a.emoji === '💡' && !b.emoji, '選單: 兩個選項送同一 label id，前綴 💡／無');
+  }
+
   console.log(`selftest-ai-flow: ${n} checks passed`);
   process.exit(0);
 }

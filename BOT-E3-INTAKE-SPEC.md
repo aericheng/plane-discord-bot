@@ -56,7 +56,7 @@ REST：`POST https://discord.com/api/v10/channels/{PLANE_CARD_CHANNEL_ID}/messag
 | `embeds[0].title` | 建到 Plane 的 issue 名稱（**不含** emoji 前綴；emoji 由 label 決定，建立時套） | 命名慣例 `${課程名稱} ${作業名稱}`，對齊使用者既有手動建立的 `📚 強化學習專論 Lab 0`。≤ 256 字 |
 | `embeds[0].url` | 來源頁（E3 作業頁／公告） | 可省略 |
 | `fields[name="截止"]` | 截止日 | **前 10 字必為 `YYYY-MM-DD`**（台北日期），後面可接 `（週X）HH:mm` 純顯示用（實作輸出 `（週日）` 這種寫法）。日期無法解析時 value 以 `❓` 開頭（例 `❓ 無法解析：11/5 前`），✅ 會被拒絕、只能走 ✏️ |
-| `fields[name="類型"]` | Plane label 名稱 | 必須是 plane-discord-bot `LABELS` 的 `name`（test／homework／presentation／remind／competition／work／class／lab／lesson／assistant／不加label）；解析端對不上就退回 `remind` |
+| `fields[name="類型"]` | Plane label 名稱 | 必須是 plane-discord-bot `LABELS` 的 `name`（test／homework／presentation／remind／competition／work／class／lab／lesson／assistant／不加label）；解析端對不上就退回 `remind`；另認 `remind（要出席）`（同一個 remind label id，名稱前加 💡；其餘 remind 不加 emoji） |
 | `fields[name="課程"]` | 顯示用 | 不進 Plane 欄位 |
 | `fields[name="描述"]` | Plane `description_html` 的純文字來源 | 可省略；≤ 1024 字（Discord 上限） |
 | `fields[name="日期來源"]` | 顯示用 | `程式自 E3 作業頁抓取` 或 `⚠️ AI 從公告內文推斷，請核對` |

@@ -7,7 +7,7 @@
 在指定頻道傳「事件名稱」後，bot 依序詢問：
 
 1. **Due date** — 單日（`7/30`、`2026-07-30`、`今天`、`明天`）或週期（`9/1到12/20的每個禮拜三`，範圍內每個週三各建一筆，單次上限 40 筆）
-2. **label** — 下拉選單或直接打字；特定 label 會在事件名稱加上前綴：💯 test、📚 homework、🗣️ presentation、💡 remind、🏆 competition
+2. **label** — 下拉選單或直接打字；特定 label 會在事件名稱加上前綴：💯 test、📚 homework、🗣️ presentation、🏆 competition；remind 預設不加前綴，只有「要出席」的才加 💡（下拉選單選「remind（要出席）」；AI 文字由 `attend` 判斷；E3 類型欄填 `remind（要出席）`）。Plane 上都是同一個 remind label
 3. **description** — 直接輸入（可多行）或打 `跳過`；描述中的時間與地點（如 `地點：X 下午2點`）會在日曆同步時被自動解析成定時事件與地點欄位
 
 中途打 `取消` 放棄、`幫助` 看用法。

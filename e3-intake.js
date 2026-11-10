@@ -8,6 +8,7 @@
 // 所有結果宣稱只憑 API 回應（issue.name／target_date／id），不憑送出值。
 
 const logger = require('./log');
+const { ATTEND_LABEL_NAME, resolveLabel, labelDisplayName } = require('./label-util');
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -72,9 +73,9 @@ function fieldValue(embed, name) {
   return f && f.value != null ? String(f.value) : '';
 }
 
+// 類型欄填「remind（要出席）」→ 帶 💡 的 remind（同 label id）；填 remind／留空 → 不加 emoji。
 function findLabel(LABELS, name) {
-  const key = String(name || '').trim().toLowerCase();
-  return key ? LABELS.find((l) => l.name.toLowerCase() === key) : undefined;
+  return resolveLabel(LABELS, name);
 }
 
 // 從卡片 embed（discord.js Embed 或 plain object 都可）取出建立 issue 需要的欄位。
@@ -92,7 +93,7 @@ function parseCardEmbed(embed, LABELS) {
   const footer = (embed && embed.footer && embed.footer.text) || '';
   const prefix = FOOTER_PREFIXES.find((p) => footer.startsWith(p));
   const candidateId = prefix ? footer.slice(prefix.length).trim() || null : null;
-  return { name, dueDate, dueRaw, labelName: label ? label.name : DEFAULT_LABEL_NAME, desc, url, candidateId };
+  return { name, dueDate, dueRaw, labelName: label ? labelDisplayName(label) : DEFAULT_LABEL_NAME, desc, url, candidateId };
 }
 
 // 同名比對用：去掉開頭 emoji／符號／空白、全形空白→半形、連續空白合併、trim、小寫。
@@ -200,7 +201,7 @@ function validateModalInput({ name, dueInput, labelInput, desc }, { parseSingleD
   const labelStr = String(labelInput == null ? '' : labelInput).trim();
   const label = labelStr ? findLabel(LABELS, labelStr) : findLabel(LABELS, DEFAULT_LABEL_NAME);
   if (!label) {
-    return { ok: false, error: `類型「${labelStr}」不在清單裡，可用：${LABELS.map((l) => l.name).join('／')}。` };
+    return { ok: false, error: `類型「${labelStr}」不在清單裡，可用：${LABELS.map((l) => l.name).join('／')}／${ATTEND_LABEL_NAME}。` };
   }
 
   return {
@@ -263,7 +264,7 @@ function buildEditModal(parsed) {
 
   const labelInput = new TextInputBuilder()
     .setCustomId('label')
-    .setLabel('類型（label 名稱，留空＝remind）')
+    .setLabel('類型（label 名稱，留空＝remind；要出席填 remind（要出席））')
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setMaxLength(45);
@@ -383,7 +384,7 @@ function buildSimilarRow() {
 async function applyCandidate(interaction, embed, { name, dueDate, label, desc }, deps, edited, force = false) {
   const { createPlaneIssue, updatePlaneIssue, fetchAllIssues, issueUrl, log = logger.log } = deps;
   const finalName = label.emoji ? `${label.emoji} ${name}` : name;
-  const edits = edited ? { name, dueDate, labelName: label.name, desc } : { labelName: label.name };
+  const edits = edited ? { name, dueDate, labelName: labelDisplayName(label), desc } : { labelName: labelDisplayName(label) };
 
   let existing;
   try {
